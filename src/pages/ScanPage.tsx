@@ -1,4 +1,4 @@
-import { FormEvent, useState } from 'react'
+import { type FormEvent, useState } from 'react'
 
 type Issue = { severity: 'critical' | 'warning' | 'info'; title: string; description: string; snippet: string }
 
