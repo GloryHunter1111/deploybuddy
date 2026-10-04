@@ -1,0 +1,760 @@
+export type IssueSeverity = 'critical' | 'warning' | 'info'
+
+export interface ScanIssue {
+  severity: IssueSeverity
+  title: string
+  description: string
+  snippet: string
+  filePath?: string
+}
+
+export interface DetectedConfig {
+  framework: 'vite' | 'next' | 'cra' | 'astro' | 'remix' | 'vue' | 'nuxt' | 'svelte' | 'static' | 'unknown'
+  frameworkName: string
+  defaultPublishDir: string
+  defaultBuildCommand: string
+  packageJsonExists: boolean
+  hasBuildScript: boolean
+  buildScriptCommand?: string
+  netlifyTomlExists: boolean
+  hasSpaRedirect: boolean
+  envExampleExists: boolean
+  referencedEnvVars: string[]
+  documentedEnvVars: string[]
+  scannedFilesCount: number
+}
+
+export interface ScanReport {
+  repoUrl: string
+  owner: string
+  repo: string
+  defaultBranch: string
+  stars: number
+  description: string | null
+  detectedConfig: DetectedConfig
+  issues: ScanIssue[]
+  scannedAt: string
+}
+
+export interface GitHubRepoRef {
+  owner: string
+  repo: string
+}
+
+interface GitHubTreeItem {
+  path: string
+  mode?: string
+  type: 'blob' | 'tree'
+  sha?: string
+  size?: number
+  url?: string
+}
+
+/**
+ * Parses various GitHub URL and shorthand formats into owner & repo.
+ */
+export function parseGitHubUrl(input: string): GitHubRepoRef | null {
+  const trimmed = input.trim()
+  if (!trimmed) return null
+
+  let pathname = trimmed
+
+  // Remove potential markdown/bracket wrappings
+  pathname = pathname.replace(/^[[<()]+|[\]>)]+$/g, '')
+
+  if (pathname.startsWith('git@github.com:')) {
+    pathname = pathname.replace('git@github.com:', '')
+  } else if (pathname.includes('github.com')) {
+    try {
+      const url = new URL(pathname.startsWith('http') ? pathname : `https://${pathname}`)
+      if (!['github.com', 'www.github.com'].includes(url.hostname)) {
+        return null
+      }
+      pathname = url.pathname
+    } catch {
+      return null
+    }
+  }
+
+  // Clean path
+  const cleaned = pathname
+    .replace(/^\/+|\/+$/g, '')
+    .replace(/\.git$/i, '')
+    .replace(/\/tree\/[^/]+.*$/i, '') // Remove trailing /tree/branch/subpath
+
+  const parts = cleaned.split('/').filter(Boolean)
+  if (parts.length < 2) return null
+
+  const [owner, repo] = parts
+
+  // Ensure valid GitHub username/repo characters
+  if (!/^[a-zA-Z0-9_.-]+$/.test(owner) || !/^[a-zA-Z0-9_.-]+$/.test(repo)) {
+    return null
+  }
+
+  return { owner, repo }
+}
+
+/**
+ * Decodes base64 text handling UTF-8 characters safely.
+ */
+function decodeBase64Utf8(base64: string): string {
+  try {
+    const clean = base64.replace(/\s/g, '')
+    const binary = atob(clean)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    return new TextDecoder('utf-8').decode(bytes)
+  } catch {
+    return atob(base64)
+  }
+}
+
+/**
+ * Fetches file content from GitHub API.
+ */
+async function fetchFileContent(
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<string | null> {
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path).replace(/%2F/g, '/')}?ref=${encodeURIComponent(ref)}`
+
+  try {
+    const response = await fetch(apiUrl, {
+      headers: {
+        Accept: 'application/vnd.github.raw+json',
+      },
+    })
+
+    if (!response.ok) {
+      // Fallback: try raw content or json decode
+      if (response.status === 404) return null
+
+      // Try raw.githubusercontent.com fallback
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${path}`
+      const rawRes = await fetch(rawUrl)
+      if (rawRes.ok) {
+        return await rawRes.text()
+      }
+      return null
+    }
+
+    const contentType = response.headers.get('content-type') || ''
+    if (contentType.includes('application/json')) {
+      const data = await response.json()
+      if (typeof data === 'string') return data
+      if (data && data.content && data.encoding === 'base64') {
+        return decodeBase64Utf8(data.content)
+      }
+      if (data && typeof data === 'object' && 'message' in data) {
+        return null
+      }
+      return JSON.stringify(data, null, 2)
+    }
+
+    return await response.text()
+  } catch {
+    // If API fetch fails, attempt raw fallback
+    try {
+      const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${path}`
+      const rawRes = await fetch(rawUrl)
+      if (rawRes.ok) return await rawRes.text()
+    } catch {
+      // ignore
+    }
+    return null
+  }
+}
+
+/**
+ * Mask secret strings so sensitive keys are never shown in full.
+ */
+function maskSecret(secret: string): string {
+  if (secret.length <= 10) return '••••••••'
+  const prefix = secret.slice(0, 7)
+  const suffix = secret.slice(-4)
+  return `${prefix}••••${suffix}`
+}
+
+/**
+ * Detect framework from package.json and repository tree.
+ */
+function detectFramework(
+  pkgJson: Record<string, unknown> | null,
+  fileTree: GitHubTreeItem[],
+): {
+  framework: DetectedConfig['framework']
+  frameworkName: string
+  defaultPublishDir: string
+  defaultBuildCommand: string
+} {
+  const allDeps: Record<string, string> = {
+    ...((pkgJson?.dependencies as Record<string, string>) || {}),
+    ...((pkgJson?.devDependencies as Record<string, string>) || {}),
+  }
+
+  const filePaths = new Set(fileTree.map((f) => f.path.toLowerCase()))
+
+  if (allDeps['next'] || filePaths.has('next.config.js') || filePaths.has('next.config.mjs') || filePaths.has('next.config.ts')) {
+    return {
+      framework: 'next',
+      frameworkName: 'Next.js',
+      defaultPublishDir: '.next',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (allDeps['vite'] || filePaths.has('vite.config.js') || filePaths.has('vite.config.ts') || filePaths.has('vite.config.mjs')) {
+    return {
+      framework: 'vite',
+      frameworkName: 'Vite',
+      defaultPublishDir: 'dist',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (allDeps['astro'] || filePaths.has('astro.config.mjs') || filePaths.has('astro.config.ts')) {
+    return {
+      framework: 'astro',
+      frameworkName: 'Astro',
+      defaultPublishDir: 'dist',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (allDeps['@remix-run/react'] || allDeps['@remix-run/netlify'] || allDeps['remix'] || filePaths.has('remix.config.js')) {
+    return {
+      framework: 'remix',
+      frameworkName: 'Remix',
+      defaultPublishDir: 'build/client',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (allDeps['nuxt'] || allDeps['nuxt3'] || filePaths.has('nuxt.config.js') || filePaths.has('nuxt.config.ts')) {
+    return {
+      framework: 'nuxt',
+      frameworkName: 'Nuxt',
+      defaultPublishDir: '.output/public',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (allDeps['react-scripts']) {
+    return {
+      framework: 'cra',
+      frameworkName: 'Create React App',
+      defaultPublishDir: 'build',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (allDeps['@sveltejs/kit'] || allDeps['svelte']) {
+    return {
+      framework: 'svelte',
+      frameworkName: 'Svelte',
+      defaultPublishDir: 'dist',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (allDeps['vue']) {
+    return {
+      framework: 'vue',
+      frameworkName: 'Vue.js',
+      defaultPublishDir: 'dist',
+      defaultBuildCommand: 'npm run build',
+    }
+  }
+
+  if (filePaths.has('index.html') && !pkgJson) {
+    return {
+      framework: 'static',
+      frameworkName: 'Static HTML',
+      defaultPublishDir: '.',
+      defaultBuildCommand: '',
+    }
+  }
+
+  return {
+    framework: 'unknown',
+    frameworkName: pkgJson ? 'Node.js App' : 'Generic Web App',
+    defaultPublishDir: 'dist',
+    defaultBuildCommand: 'npm run build',
+  }
+}
+
+/**
+ * Generate recommended netlify.toml snippet for a given framework.
+ */
+function generateRecommendedNetlifyToml(
+  framework: DetectedConfig['framework'],
+  buildCommand = 'npm run build',
+): string {
+  switch (framework) {
+    case 'next':
+      return `[build]\n  command = "${buildCommand}"\n  publish = ".next"\n\n[[plugins]]\n  package = "@netlify/plugin-nextjs"`
+    case 'cra':
+      return `[build]\n  command = "${buildCommand}"\n  publish = "build"\n\n[[redirects]]\n  from = "/*"\n  to = "/index.html"\n  status = 200`
+    case 'astro':
+      return `[build]\n  command = "${buildCommand}"\n  publish = "dist"`
+    case 'remix':
+      return `[build]\n  command = "${buildCommand}"\n  publish = "build/client"`
+    case 'nuxt':
+      return `[build]\n  command = "${buildCommand}"\n  publish = ".output/public"`
+    case 'static':
+      return `[build]\n  publish = "."\n\n[[redirects]]\n  from = "/*"\n  to = "/index.html"\n  status = 200`
+    case 'vite':
+    case 'vue':
+    case 'svelte':
+    default:
+      return `[build]\n  command = "${buildCommand}"\n  publish = "dist"\n\n[[redirects]]\n  from = "/*"\n  to = "/index.html"\n  status = 200`
+  }
+}
+
+/**
+ * Scans a public GitHub repository and produces an actionable readiness report.
+ */
+export async function scanRepository(
+  repoUrlInput: string,
+  onProgress?: (status: string) => void,
+): Promise<ScanReport> {
+  const parsed = parseGitHubUrl(repoUrlInput)
+  if (!parsed) {
+    throw new Error('Enter a valid GitHub repository URL, such as https://github.com/owner/repository.')
+  }
+
+  const { owner, repo } = parsed
+  onProgress?.(`Connecting to GitHub for ${owner}/${repo}…`)
+
+  // 1. Fetch Repository Details
+  const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+    headers: { Accept: 'application/vnd.github.v3+json' },
+  })
+
+  if (!repoRes.ok) {
+    if (repoRes.status === 404) {
+      throw new Error(`Repository "${owner}/${repo}" was not found or is private. Make sure the URL is correct and the repository is publicly accessible.`)
+    }
+    if (repoRes.status === 403 || repoRes.status === 429) {
+      throw new Error('GitHub API rate limit exceeded. Please wait a few moments before trying again.')
+    }
+    throw new Error(`Unable to scan repository (GitHub API returned status ${repoRes.status}).`)
+  }
+
+  const repoData = await repoRes.json()
+  const defaultBranch: string = repoData.default_branch || 'main'
+  const stars: number = repoData.stargazers_count ?? 0
+  const description: string | null = repoData.description ?? null
+
+  // 2. Fetch Git Tree recursively
+  onProgress?.('Fetching repository file tree…')
+  const treeRes = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/git/trees/${encodeURIComponent(defaultBranch)}?recursive=1`,
+    { headers: { Accept: 'application/vnd.github.v3+json' } },
+  )
+
+  let fileTree: GitHubTreeItem[] = []
+  if (treeRes.ok) {
+    const treeData = await treeRes.json()
+    if (Array.isArray(treeData.tree)) {
+      fileTree = treeData.tree.filter((item: GitHubTreeItem) => item.type === 'blob')
+    }
+  } else {
+    // Fallback if recursive tree isn't accessible: fetch root contents
+    const contentsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`, {
+      headers: { Accept: 'application/vnd.github.v3+json' },
+    })
+    if (contentsRes.ok) {
+      const contents = await contentsRes.json()
+      if (Array.isArray(contents)) {
+        fileTree = contents.map((item) => ({
+          path: item.path || item.name,
+          type: item.type === 'dir' ? 'tree' : 'blob',
+          size: item.size,
+        }))
+      }
+    }
+  }
+
+  if (fileTree.length === 0) {
+    throw new Error(`The repository "${owner}/${repo}" appears to be empty or has no accessible files on branch "${defaultBranch}".`)
+  }
+
+  // 3. Locate Key Configuration Files
+  const packageJsonItem = fileTree.find((f) => f.path.toLowerCase() === 'package.json')
+  const netlifyTomlItem = fileTree.find((f) => f.path.toLowerCase() === 'netlify.toml')
+  const envExampleItem = fileTree.find((f) =>
+    ['.env.example', '.env.sample', '.env.template', '.env.local.example'].includes(f.path.toLowerCase()),
+  )
+  const committedEnvItems = fileTree.filter((f) => {
+    const lower = f.path.toLowerCase()
+    return (
+      lower === '.env' ||
+      lower === '.env.local' ||
+      lower === '.env.production' ||
+      lower === '.env.staging' ||
+      lower === '.env.development' ||
+      lower.endsWith('/.env') ||
+      lower.endsWith('/.env.local')
+    )
+  })
+
+  // 4. Filter Source Files for scanning
+  const ignoredPatterns = [
+    /node_modules\//i,
+    /dist\//i,
+    /build\//i,
+    /\.next\//i,
+    /\.output\//i,
+    /\.git\//i,
+    /\.github\//i,
+    /coverage\//i,
+    /test(s)?\//i,
+    /__tests__\//i,
+    /package-lock\.json$/i,
+    /pnpm-lock\.yaml$/i,
+    /yarn\.lock$/i,
+    /bun\.lockb$/i,
+    /\.min\.(js|css)$/i,
+    /\.(png|jpe?g|gif|svg|ico|webp|pdf|mp4|woff2?|ttf|eot|zip|tar|gz|map)$/i,
+  ]
+
+  const sourceFiles = fileTree
+    .filter((f) => !ignoredPatterns.some((pattern) => pattern.test(f.path)))
+    .filter((f) => /\.(jsx?|tsx?|vue|svelte|mjs|cjs|html|json)$/i.test(f.path))
+
+  // Sort source files by priority (lib, services, components, pages, app, root)
+  const prioritizedSourceFiles = [...sourceFiles].sort((a, b) => {
+    const score = (p: string) => {
+      const lp = p.toLowerCase()
+      if (lp.includes('supabase') || lp.includes('client') || lp.includes('auth')) return 10
+      if (lp.startsWith('src/lib') || lp.startsWith('src/services') || lp.startsWith('src/api')) return 8
+      if (lp.startsWith('src/app') || lp.startsWith('src/pages') || lp.startsWith('src/routes')) return 6
+      if (lp.startsWith('src/components') || lp === 'src/app.tsx' || lp === 'src/main.tsx') return 5
+      if (lp.endsWith('.ts') || lp.endsWith('.tsx') || lp.endsWith('.js') || lp.endsWith('.jsx')) return 3
+      return 1
+    }
+    return score(b.path) - score(a.path)
+  })
+
+  // Cap source files to analyze to maintain fast response and stay well within rate limits
+  const selectedSourceFiles = prioritizedSourceFiles.slice(0, 20)
+
+  // 5. Read Key Files
+  onProgress?.('Analyzing package.json and configuration…')
+
+  let pkgJsonContent: Record<string, unknown> | null = null
+  let pkgJsonRaw = ''
+  if (packageJsonItem) {
+    const raw = await fetchFileContent(owner, repo, packageJsonItem.path, defaultBranch)
+    if (raw) {
+      pkgJsonRaw = raw
+      try {
+        pkgJsonContent = JSON.parse(raw)
+      } catch {
+        // malformed json
+      }
+    }
+  }
+
+  let netlifyTomlRaw: string | null = null
+  if (netlifyTomlItem) {
+    netlifyTomlRaw = await fetchFileContent(owner, repo, netlifyTomlItem.path, defaultBranch)
+  }
+
+  let envExampleRaw: string | null = null
+  if (envExampleItem) {
+    envExampleRaw = await fetchFileContent(owner, repo, envExampleItem.path, defaultBranch)
+  }
+
+  // 6. Read Source Files in Parallel Batches
+  onProgress?.(`Inspecting source files for secrets and environment variables…`)
+  const fileContentsMap = new Map<string, string>()
+
+  const BATCH_SIZE = 5
+  for (let i = 0; i < selectedSourceFiles.length; i += BATCH_SIZE) {
+    const batch = selectedSourceFiles.slice(i, i + BATCH_SIZE)
+    await Promise.all(
+      batch.map(async (file) => {
+        if (file.path === 'package.json' && pkgJsonRaw) {
+          fileContentsMap.set(file.path, pkgJsonRaw)
+          return
+        }
+        const content = await fetchFileContent(owner, repo, file.path, defaultBranch)
+        if (content) {
+          fileContentsMap.set(file.path, content)
+        }
+      }),
+    )
+  }
+
+  // 7. Run Rules & Diagnostics
+  onProgress?.('Evaluating readiness checks…')
+  const issues: ScanIssue[] = []
+
+  // Framework Detection
+  const { framework, frameworkName, defaultPublishDir, defaultBuildCommand } = detectFramework(
+    pkgJsonContent,
+    fileTree,
+  )
+
+  const scripts = (pkgJsonContent?.scripts as Record<string, string>) || {}
+  const hasBuildScript = Boolean(scripts.build)
+  const buildScriptCommand = scripts.build
+
+  // Collect environment variables from source files
+  const referencedEnvVarsSet = new Set<string>()
+  const standardEnvIgnores = new Set(['NODE_ENV', 'MODE', 'BASE_URL', 'PROD', 'DEV', 'SSR', 'PUBLIC_URL'])
+
+  // Check for Hardcoded Secrets
+  const secretPatterns = [
+    { name: 'OpenAI API Key', regex: /\b(sk-[a-zA-Z0-9_-]{20,}|sk-proj-[a-zA-Z0-9_-]{20,})\b/g },
+    { name: 'Stripe Secret Key', regex: /\b(sk_live_[0-9a-zA-Z]{24,}|rk_live_[0-9a-zA-Z]{24,}|sk_test_[0-9a-zA-Z]{24,})\b/g },
+    { name: 'Anthropic API Key', regex: /\b(sk-ant-api03-[a-zA-Z0-9_-]{30,})\b/g },
+    { name: 'GitHub Personal Access Token', regex: /\b(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{40,})\b/g },
+    { name: 'Supabase Access Token', regex: /\b(sbp_[a-zA-Z0-9]{30,})\b/g },
+    { name: 'AWS Access Key ID', regex: /\b(AKIA[0-9A-Z]{16})\b/g },
+    { name: 'Google API Key', regex: /\b(AIza[0-9A-Za-z-_]{35})\b/g },
+  ]
+
+  // Scan source files for env vars and secrets
+  fileContentsMap.forEach((content, filePath) => {
+    // Collect env vars: import.meta.env.X and process.env.X
+    const importMetaMatches = content.matchAll(/\bimport\.meta\.env\.([A-Z0-9_]+)\b/g)
+    for (const match of importMetaMatches) {
+      if (match[1] && !standardEnvIgnores.has(match[1])) {
+        referencedEnvVarsSet.add(match[1])
+      }
+    }
+
+    const processEnvMatches = content.matchAll(/\bprocess\.env\.([A-Z0-9_]+)\b/g)
+    for (const match of processEnvMatches) {
+      if (match[1] && !standardEnvIgnores.has(match[1])) {
+        referencedEnvVarsSet.add(match[1])
+      }
+    }
+
+    // Skip secret checks on documentation, mock data or package.json
+    if (filePath.endsWith('.md') || filePath.endsWith('.json') || filePath.endsWith('.txt')) {
+      return
+    }
+
+    // Check for hardcoded API keys
+    for (const pattern of secretPatterns) {
+      pattern.regex.lastIndex = 0
+      const match = pattern.regex.exec(content)
+      if (match && match[1]) {
+        const detectedKey = match[1]
+        // Avoid flagging placeholder values like sk-proj-xxxxxxxxxxxx
+        if (/^sk(-proj)?-[xX0]+$/.test(detectedKey) || detectedKey.includes('example') || detectedKey.includes('placeholder')) {
+          continue
+        }
+
+        issues.push({
+          severity: 'warning',
+          title: `Hardcoded ${pattern.name} found in ${filePath}`,
+          description: `A credential shaped like a ${pattern.name} (${maskSecret(detectedKey)}) was detected directly in source code. Hardcoded keys in repositories can be publicly indexed, leading to compromised security and unexpected API charges.`,
+          snippet: `// Move secret from ${filePath} to your environment variables:\n// In .env.local:\nVITE_${pattern.name.toUpperCase().replace(/\s+/g, '_')}=your_actual_key_here\n\n// In ${filePath}:\nconst apiKey = import.meta.env.VITE_${pattern.name.toUpperCase().replace(/\s+/g, '_')}`,
+          filePath,
+        })
+      }
+    }
+
+    // Check for raw Supabase JWT key hardcoded directly in createClient calls
+    const supabaseClientRawKeyMatch = content.match(/createClient\s*\(\s*['"][^'"]+['"]\s*,\s*['"](eyJ[a-zA-Z0-9._-]{50,})['"]/i)
+    if (supabaseClientRawKeyMatch && supabaseClientRawKeyMatch[1]) {
+      const rawToken = supabaseClientRawKeyMatch[1]
+      issues.push({
+        severity: 'warning',
+        title: `Hardcoded Supabase key found in ${filePath}`,
+        description: `A hardcoded Supabase API token (${maskSecret(rawToken)}) was found in createClient(). Exposing hardcoded keys in source files makes rotating credentials difficult and risks leaking elevated permissions.`,
+        snippet: `// In ${filePath}, load Supabase keys from environment variables:\nimport { createClient } from '@supabase/supabase-js'\n\nconst supabaseUrl = import.meta.env.VITE_SUPABASE_URL\nconst supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY\n\nexport const supabase = createClient(supabaseUrl, supabaseAnonKey)`,
+        filePath,
+      })
+    }
+
+    // Check for Service Role Key in client-side code
+    if (
+      content.includes('VITE_SUPABASE_SERVICE_ROLE_KEY') ||
+      content.includes('NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY') ||
+      (content.includes('service_role') && (filePath.startsWith('src/') || filePath.startsWith('app/') || filePath.startsWith('pages/')))
+    ) {
+      if (content.includes('VITE_SUPABASE_SERVICE_ROLE_KEY') || content.includes('NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY')) {
+        issues.push({
+          severity: 'warning',
+          title: `Supabase service-role key exposed in client code (${filePath})`,
+          description: `The Supabase service-role key was found with a client-exposed environment prefix. The service-role key bypasses all Row Level Security (RLS) policies and must NEVER be loaded into frontend code.`,
+          snippet: `// In frontend code, only use the public anon key:\nconst supabase = createClient(\n  import.meta.env.VITE_SUPABASE_URL,\n  import.meta.env.VITE_SUPABASE_ANON_KEY\n)`,
+          filePath,
+        })
+      }
+    }
+  })
+
+  // Check for committed .env files
+  if (committedEnvItems.length > 0) {
+    const committedNames = committedEnvItems.map((f) => f.path).join(', ')
+    issues.push({
+      severity: 'warning',
+      title: `Sensitive environment file committed to git (${committedNames})`,
+      description: `The repository contains committed environment file(s) (${committedNames}). Actual environment files containing secrets or project credentials should be listed in .gitignore and never committed to version control.`,
+      snippet: `# Add environment files to your .gitignore:\n.env\n.env.local\n.env.*.local\n*.env`,
+    })
+  }
+
+  // Check 1: netlify.toml Checks
+  let hasSpaRedirect = false
+  if (!netlifyTomlItem) {
+    issues.push({
+      severity: 'warning',
+      title: 'Missing netlify.toml configuration',
+      description: `No netlify.toml configuration file was found in the repository root. Without it, Netlify may fail to build your project or return 404 errors when users refresh client-side routes.`,
+      snippet: generateRecommendedNetlifyToml(framework, buildScriptCommand ? 'npm run build' : defaultBuildCommand),
+    })
+  } else if (netlifyTomlRaw) {
+    // Check if SPA redirect exists
+    const hasRedirectBlock = /\[\[redirects\]\]/i.test(netlifyTomlRaw)
+    const hasIndexRedirect = /from\s*=\s*['"]\/\*['"][\s\S]*?to\s*=\s*['"]\/index\.html['"]/i.test(netlifyTomlRaw) ||
+      /from\s*=\s*['"]\/\*['"][\s\S]*?status\s*=\s*200/i.test(netlifyTomlRaw)
+
+    hasSpaRedirect = hasRedirectBlock && hasIndexRedirect
+
+    // SPAs like Vite, CRA, Vue, Svelte require SPA redirect rule
+    const isSpa = ['vite', 'cra', 'vue', 'svelte'].includes(framework)
+    if (isSpa && !hasSpaRedirect) {
+      issues.push({
+        severity: 'warning',
+        title: 'Missing SPA redirect rule in netlify.toml',
+        description: `Single-page applications (SPAs) require a wildcard redirect rule (/* -> /index.html) so Netlify serves index.html for client-side routes instead of returning a 404 on page refresh.`,
+        snippet: `[[redirects]]\n  from = "/*"\n  to = "/index.html"\n  status = 200`,
+      })
+    }
+
+    // Check build command and publish folder in netlify.toml
+    const commandMatch = netlifyTomlRaw.match(/command\s*=\s*['"]([^'"]+)['"]/i)
+    const publishMatch = netlifyTomlRaw.match(/publish\s*=\s*['"]([^'"]+)['"]/i)
+
+    if (commandMatch && commandMatch[1] && pkgJsonContent) {
+      const tomlCmd = commandMatch[1].trim()
+      const runMatch = tomlCmd.match(/^(?:npm run|pnpm run|yarn run|yarn)\s+([a-zA-Z0-9_:-]+)/i)
+      if (runMatch && runMatch[1]) {
+        const targetScript = runMatch[1]
+        if (!scripts[targetScript]) {
+          issues.push({
+            severity: 'warning',
+            title: 'Build command mismatch between netlify.toml and package.json',
+            description: `netlify.toml specifies command = "${tomlCmd}", but the script "${targetScript}" does not exist in package.json scripts.`,
+            snippet: `[build]\n  command = "${hasBuildScript ? 'npm run build' : 'npm run ' + Object.keys(scripts)[0]}"\n  publish = "${publishMatch?.[1] || defaultPublishDir}"`,
+          })
+        }
+      }
+    }
+
+    if (publishMatch && publishMatch[1]) {
+      const publishDir = publishMatch[1].trim()
+      if (framework === 'vite' && publishDir === 'build') {
+        issues.push({
+          severity: 'warning',
+          title: 'Publish directory mismatch in netlify.toml',
+          description: `netlify.toml specifies publish = "${publishDir}", but Vite builds to "dist" by default. Netlify will not find your built HTML/JS assets.`,
+          snippet: `[build]\n  command = "${commandMatch?.[1] || 'npm run build'}"\n  publish = "dist"`,
+        })
+      } else if (framework === 'cra' && publishDir === 'dist') {
+        issues.push({
+          severity: 'warning',
+          title: 'Publish directory mismatch in netlify.toml',
+          description: `netlify.toml specifies publish = "${publishDir}", but Create React App builds to "build" by default.`,
+          snippet: `[build]\n  command = "${commandMatch?.[1] || 'npm run build'}"\n  publish = "build"`,
+        })
+      }
+    }
+  }
+
+  // Check 2: Missing build script in package.json
+  if (pkgJsonContent && !hasBuildScript && framework !== 'static') {
+    issues.push({
+      severity: 'warning',
+      title: 'Missing "build" script in package.json',
+      description: `package.json does not define a "build" script under "scripts". Netlify and other CI/CD platforms expect "npm run build" to generate production assets.`,
+      snippet: `"scripts": {\n  "build": "${framework === 'vite' ? 'vite build' : 'tsc -b && vite build'}"\n}`,
+    })
+  }
+
+  // Check 3: Missing or incomplete .env.example
+  const referencedEnvVars = Array.from(referencedEnvVarsSet).sort()
+  const documentedEnvVars: string[] = []
+
+  if (envExampleRaw) {
+    const lines = envExampleRaw.split(/\r?\n/)
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (trimmed && !trimmed.startsWith('#')) {
+        const key = trimmed.split('=')[0]?.trim()
+        if (key) documentedEnvVars.push(key)
+      }
+    }
+
+    const missingInExample = referencedEnvVars.filter((v) => !documentedEnvVars.includes(v))
+    if (missingInExample.length > 0) {
+      issues.push({
+        severity: 'info',
+        title: 'Undocumented environment variables in .env.example',
+        description: `Your source code references environment variable${missingInExample.length > 1 ? 's that are' : ' that is'} missing from .env.example: ${missingInExample.join(', ')}.`,
+        snippet: `# Add missing variables to .env.example:\n${missingInExample.map((v) => `${v}=`).join('\n')}`,
+      })
+    }
+  } else {
+    // Missing .env.example entirely
+    const envSnippet = referencedEnvVars.length > 0
+      ? `# .env.example — Copy to .env.local and populate\n${referencedEnvVars.map((v) => `${v}=`).join('\n')}`
+      : `# .env.example — Copy to .env.local and populate\nVITE_SUPABASE_URL=\nVITE_SUPABASE_ANON_KEY=`
+
+    issues.push({
+      severity: 'info',
+      title: 'Missing .env.example template',
+      description: referencedEnvVars.length > 0
+        ? `Your codebase references ${referencedEnvVars.length} environment variable${referencedEnvVars.length > 1 ? 's' : ''} (${referencedEnvVars.join(', ')}), but no .env.example file was found in the repository root. Adding one helps deployment platforms and collaborators identify required values.`
+        : `No .env.example template file was found. Adding one provides a documented template for environment variables required by your app.`,
+      snippet: envSnippet,
+    })
+  }
+
+  // Sort issues by severity: critical -> warning -> info
+  const severityOrder: Record<IssueSeverity, number> = {
+    critical: 0,
+    warning: 1,
+    info: 2,
+  }
+  issues.sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity])
+
+  return {
+    repoUrl: repoUrlInput,
+    owner,
+    repo,
+    defaultBranch,
+    stars,
+    description,
+    detectedConfig: {
+      framework,
+      frameworkName,
+      defaultPublishDir,
+      defaultBuildCommand,
+      packageJsonExists: Boolean(packageJsonItem),
+      hasBuildScript,
+      buildScriptCommand,
+      netlifyTomlExists: Boolean(netlifyTomlItem),
+      hasSpaRedirect,
+      envExampleExists: Boolean(envExampleItem),
+      referencedEnvVars,
+      documentedEnvVars,
+      scannedFilesCount: selectedSourceFiles.length + (packageJsonItem ? 1 : 0) + (netlifyTomlItem ? 1 : 0),
+    },
+    issues,
+    scannedAt: new Date().toISOString(),
+  }
+}
