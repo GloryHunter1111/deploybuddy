@@ -50,6 +50,65 @@ interface GitHubTreeItem {
   url?: string
 }
 
+const STANDARD_SYSTEM_ENV_VARS = new Set([
+  'NODE_ENV',
+  'MODE',
+  'BASE_URL',
+  'PROD',
+  'DEV',
+  'SSR',
+  'PUBLIC_URL',
+])
+
+const PLACEHOLDER_ENV_NAMES = new Set([
+  'X',
+  'Y',
+  'Z',
+  'I',
+  'K',
+  'V',
+  'ENV',
+  'VARS',
+  'VAR',
+  'KEY',
+  'SOME_KEY',
+  'YOUR_KEY',
+  'API_KEY',
+  'SECRET',
+  'TOKEN',
+  'FOO',
+  'BAR',
+  'BAZ',
+  'EXAMPLE',
+  'PLACEHOLDER',
+  'UNDEFINED',
+  'NULL',
+  'TRUE',
+  'FALSE',
+])
+
+/**
+ * Validates whether an extracted string is a legitimate environment variable name.
+ */
+function isValidEnvVarName(name: string): boolean {
+  if (!name || name.length < 2) return false
+  if (name.endsWith('_')) return false
+  if (STANDARD_SYSTEM_ENV_VARS.has(name)) return false
+  if (PLACEHOLDER_ENV_NAMES.has(name)) return false
+  // Must start with uppercase letter, contain only uppercase alphanumerics/underscores, and end with alphanumeric
+  return /^[A-Z][A-Z0-9_]*[A-Z0-9]$/.test(name)
+}
+
+/**
+ * Strip comments from code so comment text/examples are not mistaken for live code references.
+ */
+function stripComments(code: string): string {
+  return code
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*/g, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+}
+
 /**
  * Parses various GitHub URL and shorthand formats into owner & repo.
  */
@@ -113,6 +172,23 @@ function decodeBase64Utf8(base64: string): string {
 }
 
 /**
+ * Safely inspects a JWT token payload to see if its role is service_role.
+ */
+function isSupabaseServiceRoleJwt(token: string): boolean {
+  try {
+    const parts = token.split('.')
+    if (parts.length !== 3) return false
+    const base64Url = parts[1]
+    const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/')
+    const jsonStr = atob(base64)
+    const payload = JSON.parse(jsonStr) as { role?: string }
+    return payload.role === 'service_role'
+  } catch {
+    return false
+  }
+}
+
+/**
  * Fetches file content from GitHub API.
  */
 async function fetchFileContent(
@@ -131,7 +207,6 @@ async function fetchFileContent(
     })
 
     if (!response.ok) {
-      // Fallback: try raw content or json decode
       if (response.status === 404) return null
 
       // Try raw.githubusercontent.com fallback
@@ -158,7 +233,6 @@ async function fetchFileContent(
 
     return await response.text()
   } catch {
-    // If API fetch fails, attempt raw fallback
     try {
       const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/${path}`
       const rawRes = await fetch(rawUrl)
@@ -404,7 +478,7 @@ export async function scanRepository(
     )
   })
 
-  // 4. Filter Source Files for scanning
+  // 4. Filter Source Files for scanning (exclude tests, doc, tooling, and scanner's own code)
   const ignoredPatterns = [
     /node_modules\//i,
     /dist\//i,
@@ -416,6 +490,9 @@ export async function scanRepository(
     /coverage\//i,
     /test(s)?\//i,
     /__tests__\//i,
+    /\.(test|spec)\.[a-z0-9]+$/i,
+    /\.d\.ts$/i,
+    /(^|\/)(scanner|scanner\.test|repo-scanner)\.(ts|js|tsx|jsx)$/i,
     /package-lock\.json$/i,
     /pnpm-lock\.yaml$/i,
     /yarn\.lock$/i,
@@ -473,7 +550,7 @@ export async function scanRepository(
   }
 
   // 6. Read Source Files in Parallel Batches
-  onProgress?.(`Inspecting source files for secrets and environment variables…`)
+  onProgress?.('Inspecting source files for secrets and environment variables…')
   const fileContentsMap = new Map<string, string>()
 
   const BATCH_SIZE = 5
@@ -509,32 +586,42 @@ export async function scanRepository(
 
   // Collect environment variables from source files
   const referencedEnvVarsSet = new Set<string>()
-  const standardEnvIgnores = new Set(['NODE_ENV', 'MODE', 'BASE_URL', 'PROD', 'DEV', 'SSR', 'PUBLIC_URL'])
 
-  // Check for Hardcoded Secrets
+  // High-confidence regex patterns for actual hardcoded secret keys
   const secretPatterns = [
-    { name: 'OpenAI API Key', regex: /\b(sk-[a-zA-Z0-9_-]{20,}|sk-proj-[a-zA-Z0-9_-]{20,})\b/g },
-    { name: 'Stripe Secret Key', regex: /\b(sk_live_[0-9a-zA-Z]{24,}|rk_live_[0-9a-zA-Z]{24,}|sk_test_[0-9a-zA-Z]{24,})\b/g },
-    { name: 'Anthropic API Key', regex: /\b(sk-ant-api03-[a-zA-Z0-9_-]{30,})\b/g },
-    { name: 'GitHub Personal Access Token', regex: /\b(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{40,})\b/g },
-    { name: 'Supabase Access Token', regex: /\b(sbp_[a-zA-Z0-9]{30,})\b/g },
+    { name: 'OpenAI Project API Key', regex: /\b(sk-proj-[a-zA-Z0-9_-]{48,})\b/g },
+    { name: 'OpenAI API Key', regex: /\b(sk-[a-zA-Z0-9]{32,48})\b/g },
+    { name: 'Stripe Live Secret Key', regex: /\b(sk_live_[0-9a-zA-Z]{24,}|rk_live_[0-9a-zA-Z]{24,})\b/g },
+    { name: 'Anthropic API Key', regex: /\b(sk-ant-api03-[a-zA-Z0-9_-]{50,})\b/g },
+    { name: 'GitHub Personal Access Token', regex: /\b(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{50,})\b/g },
+    { name: 'Supabase Management Token', regex: /\b(sbp_[a-zA-Z0-9]{40,})\b/g },
     { name: 'AWS Access Key ID', regex: /\b(AKIA[0-9A-Z]{16})\b/g },
     { name: 'Google API Key', regex: /\b(AIza[0-9A-Za-z-_]{35})\b/g },
   ]
 
   // Scan source files for env vars and secrets
-  fileContentsMap.forEach((content, filePath) => {
-    // Collect env vars: import.meta.env.X and process.env.X
-    const importMetaMatches = content.matchAll(/\bimport\.meta\.env\.([A-Z0-9_]+)\b/g)
-    for (const match of importMetaMatches) {
-      if (match[1] && !standardEnvIgnores.has(match[1])) {
+  fileContentsMap.forEach((rawContent, filePath) => {
+    // Strip comments to avoid false positives on commented-out code or documentation
+    const cleanedContent = stripComments(rawContent)
+
+    // 1. Collect full, real environment variable names
+    const dotImportMatches = cleanedContent.matchAll(/\bimport\.meta\.env\.([A-Z][A-Z0-9_]*[A-Z0-9])\b/g)
+    for (const match of dotImportMatches) {
+      if (isValidEnvVarName(match[1])) {
         referencedEnvVarsSet.add(match[1])
       }
     }
 
-    const processEnvMatches = content.matchAll(/\bprocess\.env\.([A-Z0-9_]+)\b/g)
-    for (const match of processEnvMatches) {
-      if (match[1] && !standardEnvIgnores.has(match[1])) {
+    const dotProcessMatches = cleanedContent.matchAll(/\bprocess\.env\.([A-Z][A-Z0-9_]*[A-Z0-9])\b/g)
+    for (const match of dotProcessMatches) {
+      if (isValidEnvVarName(match[1])) {
+        referencedEnvVarsSet.add(match[1])
+      }
+    }
+
+    const bracketMatches = cleanedContent.matchAll(/\b(?:import\.meta\.env|process\.env)\[['"]([A-Z][A-Z0-9_]*[A-Z0-9])['"]\]/g)
+    for (const match of bracketMatches) {
+      if (isValidEnvVarName(match[1])) {
         referencedEnvVarsSet.add(match[1])
       }
     }
@@ -544,14 +631,20 @@ export async function scanRepository(
       return
     }
 
-    // Check for hardcoded API keys
+    // 2. Check for hardcoded API key values
     for (const pattern of secretPatterns) {
       pattern.regex.lastIndex = 0
-      const match = pattern.regex.exec(content)
+      const match = pattern.regex.exec(cleanedContent)
       if (match && match[1]) {
         const detectedKey = match[1]
-        // Avoid flagging placeholder values like sk-proj-xxxxxxxxxxxx
-        if (/^sk(-proj)?-[xX0]+$/.test(detectedKey) || detectedKey.includes('example') || detectedKey.includes('placeholder')) {
+        // Filter dummy or placeholder strings
+        if (
+          /^sk(-proj)?-[xX0]+$/.test(detectedKey) ||
+          detectedKey.includes('example') ||
+          detectedKey.includes('placeholder') ||
+          detectedKey.includes('your_') ||
+          detectedKey === 'AKIAIOSFODNN7EXAMPLE'
+        ) {
           continue
         }
 
@@ -565,34 +658,36 @@ export async function scanRepository(
       }
     }
 
-    // Check for raw Supabase JWT key hardcoded directly in createClient calls
-    const supabaseClientRawKeyMatch = content.match(/createClient\s*\(\s*['"][^'"]+['"]\s*,\s*['"](eyJ[a-zA-Z0-9._-]{50,})['"]/i)
-    if (supabaseClientRawKeyMatch && supabaseClientRawKeyMatch[1]) {
-      const rawToken = supabaseClientRawKeyMatch[1]
-      issues.push({
-        severity: 'warning',
-        title: `Hardcoded Supabase key found in ${filePath}`,
-        description: `A hardcoded Supabase API token (${maskSecret(rawToken)}) was found in createClient(). Exposing hardcoded keys in source files makes rotating credentials difficult and risks leaking elevated permissions.`,
-        snippet: `// In ${filePath}, load Supabase keys from environment variables:\nimport { createClient } from '@supabase/supabase-js'\n\nconst supabaseUrl = import.meta.env.VITE_SUPABASE_URL\nconst supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY\n\nexport const supabase = createClient(supabaseUrl, supabaseAnonKey)`,
-        filePath,
-      })
-    }
-
-    // Check for Service Role Key in client-side code
-    if (
-      content.includes('VITE_SUPABASE_SERVICE_ROLE_KEY') ||
-      content.includes('NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY') ||
-      (content.includes('service_role') && (filePath.startsWith('src/') || filePath.startsWith('app/') || filePath.startsWith('pages/')))
-    ) {
-      if (content.includes('VITE_SUPABASE_SERVICE_ROLE_KEY') || content.includes('NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY')) {
+    // 3. Check for hardcoded Supabase Service Role JWT or raw JWT token in createClient()
+    const rawJwtMatches = cleanedContent.matchAll(/createClient\s*\(\s*['"][^'"]+['"]\s*,\s*['"](eyJ[a-zA-Z0-9._-]{50,})['"]/g)
+    for (const match of rawJwtMatches) {
+      if (match[1]) {
+        const rawToken = match[1]
+        const isServiceRole = isSupabaseServiceRoleJwt(rawToken)
         issues.push({
           severity: 'warning',
-          title: `Supabase service-role key exposed in client code (${filePath})`,
-          description: `The Supabase service-role key was found with a client-exposed environment prefix. The service-role key bypasses all Row Level Security (RLS) policies and must NEVER be loaded into frontend code.`,
-          snippet: `// In frontend code, only use the public anon key:\nconst supabase = createClient(\n  import.meta.env.VITE_SUPABASE_URL,\n  import.meta.env.VITE_SUPABASE_ANON_KEY\n)`,
+          title: isServiceRole
+            ? `Exposed Supabase service-role key found in ${filePath}`
+            : `Hardcoded Supabase API key found in ${filePath}`,
+          description: isServiceRole
+            ? `A hardcoded Supabase service_role JWT key (${maskSecret(rawToken)}) was found in createClient(). The service-role key bypasses all Row Level Security (RLS) policies and must NEVER be exposed in frontend client code.`
+            : `A hardcoded Supabase API token (${maskSecret(rawToken)}) was found in createClient(). Keys should be loaded from environment variables rather than hardcoded in source code.`,
+          snippet: `// In ${filePath}, load Supabase keys from environment variables:\nimport { createClient } from '@supabase/supabase-js'\n\nconst supabaseUrl = import.meta.env.VITE_SUPABASE_URL\nconst supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY\n\nexport const supabase = createClient(supabaseUrl, supabaseAnonKey)`,
           filePath,
         })
       }
+    }
+
+    // 4. Check for Client-Exposed Service Role variable reference in code
+    const serviceRoleVarRegex = /\b(?:import\.meta\.env|process\.env)(?:\.(?:VITE_|NEXT_PUBLIC_)|\[['"](?:VITE_|NEXT_PUBLIC_))SUPABASE_SERVICE_ROLE_KEY\b/
+    if (serviceRoleVarRegex.test(cleanedContent)) {
+      issues.push({
+        severity: 'warning',
+        title: `Supabase service-role key exposed in client code (${filePath})`,
+        description: `The Supabase service-role key was found referenced with a client-exposed environment prefix (VITE_ / NEXT_PUBLIC_). The service-role key bypasses all Row Level Security (RLS) policies and must NEVER be loaded into frontend code.`,
+        snippet: `// In frontend code, only use the public anon key:\nconst supabase = createClient(\n  import.meta.env.VITE_SUPABASE_URL,\n  import.meta.env.VITE_SUPABASE_ANON_KEY\n)`,
+        filePath,
+      })
     }
   })
 
@@ -695,7 +790,9 @@ export async function scanRepository(
       const trimmed = line.trim()
       if (trimmed && !trimmed.startsWith('#')) {
         const key = trimmed.split('=')[0]?.trim()
-        if (key) documentedEnvVars.push(key)
+        if (key && isValidEnvVarName(key)) {
+          documentedEnvVars.push(key)
+        }
       }
     }
 
