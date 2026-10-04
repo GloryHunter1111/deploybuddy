@@ -1,8 +1,13 @@
 import { type FormEvent, useEffect, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useLocation, useSearchParams } from 'react-router-dom'
+import { useAuth } from '../context/AuthContext'
 import { parseGitHubUrl, scanRepository, type ScanReport } from '../lib/scanner'
+import { getUserProjects, saveProjectScan } from '../lib/projects'
+import { isSupabaseConfigured, supabaseConfigurationMessage } from '../lib/supabase'
 
 export function ScanPage() {
+  const { session } = useAuth()
+  const location = useLocation()
   const [searchParams, setSearchParams] = useSearchParams()
   const initialRepo = searchParams.get('repo') || ''
 
@@ -13,6 +18,29 @@ export function ScanPage() {
   const [report, setReport] = useState<ScanReport | null>(null)
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
 
+  // Save project state
+  const [isSaving, setIsSaving] = useState(false)
+  const [saveSuccessMessage, setSaveSuccessMessage] = useState('')
+  const [saveErrorMessage, setSaveErrorMessage] = useState('')
+  const [isLimitReached, setIsLimitReached] = useState(false)
+  const [isAlreadySaved, setIsAlreadySaved] = useState(false)
+
+  async function checkExistingProject(currentRepoUrl: string, owner: string, repo: string) {
+    if (!session) return
+    try {
+      const projects = await getUserProjects(session.user.id)
+      const fullName = `${owner}/${repo}`.toLowerCase()
+      const found = projects.some(
+        (p) =>
+          p.repo_url.toLowerCase().trim() === currentRepoUrl.toLowerCase().trim() ||
+          p.name.toLowerCase().trim() === fullName,
+      )
+      setIsAlreadySaved(found)
+    } catch {
+      // ignore
+    }
+  }
+
   async function performScan(targetUrl: string) {
     const parsed = parseGitHubUrl(targetUrl)
     if (!parsed) {
@@ -22,6 +50,9 @@ export function ScanPage() {
     }
 
     setError('')
+    setSaveSuccessMessage('')
+    setSaveErrorMessage('')
+    setIsLimitReached(false)
     setIsScanning(true)
     setScanStatus('Connecting to GitHub…')
 
@@ -30,6 +61,9 @@ export function ScanPage() {
         setScanStatus(status)
       })
       setReport(result)
+      if (session) {
+        void checkExistingProject(targetUrl, result.owner, result.repo)
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'An unexpected error occurred while scanning the repository.'
       setError(message)
@@ -59,6 +93,38 @@ export function ScanPage() {
     // Update query param
     setSearchParams({ repo: trimmed })
     void performScan(trimmed)
+  }
+
+  async function handleSaveProject() {
+    if (!session || !report) return
+
+    if (!isSupabaseConfigured) {
+      setSaveErrorMessage(supabaseConfigurationMessage)
+      return
+    }
+
+    setIsSaving(true)
+    setSaveSuccessMessage('')
+    setSaveErrorMessage('')
+    setIsLimitReached(false)
+
+    try {
+      const result = await saveProjectScan(session.user.id, report)
+      if (result.limitReached) {
+        setIsLimitReached(true)
+        setSaveErrorMessage(result.message || "You've reached the free plan limit of 1 project. Upgrade to save more.")
+      } else if (!result.success) {
+        setSaveErrorMessage(result.message || 'Failed to save project.')
+      } else {
+        setIsAlreadySaved(true)
+        setSaveSuccessMessage(result.isNew ? 'Project saved to your workspace!' : 'Saved scan updated in workspace!')
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'An error occurred while saving the project.'
+      setSaveErrorMessage(msg)
+    } finally {
+      setIsSaving(false)
+    }
   }
 
   async function handleCopy(text: string, index: number) {
@@ -167,6 +233,86 @@ export function ScanPage() {
                 )}
               </div>
             </div>
+
+            {/* Project Saving Actions */}
+            <div className="mt-5 pt-4 border-t border-white/10 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+              {session ? (
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveProject()}
+                    disabled={isSaving}
+                    className="button-primary text-xs py-2 px-3.5"
+                  >
+                    {isSaving
+                      ? 'Saving project…'
+                      : isAlreadySaved
+                        ? 'Update saved scan'
+                        : 'Save this project'}
+                  </button>
+                  {isAlreadySaved && (
+                    <span className="text-xs text-zinc-400">Saved in your workspace</span>
+                  )}
+                </div>
+              ) : (
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-zinc-400">Want to track this project in your dashboard?</span>
+                  <Link
+                    to="/login"
+                    state={{ from: `${location.pathname}${location.search}` }}
+                    className="button-secondary text-xs py-1.5 px-3"
+                  >
+                    Sign in to save this project
+                  </Link>
+                </div>
+              )}
+
+              {session && (
+                <Link
+                  to="/dashboard"
+                  className="text-xs font-medium text-zinc-400 hover:text-white transition-colors"
+                >
+                  Go to Dashboard →
+                </Link>
+              )}
+            </div>
+
+            {/* Save Success Banner */}
+            {saveSuccessMessage && (
+              <div className="mt-4 rounded-xl border border-lime-400/20 bg-lime-400/10 p-3.5 text-sm text-lime-200 flex items-center justify-between animate-in">
+                <span className="flex items-center gap-2">
+                  <span className="font-bold">✓</span> {saveSuccessMessage}
+                </span>
+                <Link to="/dashboard" className="text-xs font-semibold text-lime-300 hover:underline">
+                  View in Dashboard →
+                </Link>
+              </div>
+            )}
+
+            {/* Save Error or Plan Limit Banner */}
+            {saveErrorMessage && (
+              <div
+                className={`mt-4 rounded-xl p-4 text-sm leading-6 animate-in ${
+                  isLimitReached
+                    ? 'border border-amber-400/20 bg-amber-400/10 text-amber-200'
+                    : 'border border-rose-500/20 bg-rose-500/10 text-rose-200'
+                }`}
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <div>
+                    <p className="font-semibold text-white">
+                      {isLimitReached ? 'Free plan limit reached' : 'Could not save project'}
+                    </p>
+                    <p className="mt-0.5 text-xs text-zinc-300">{saveErrorMessage}</p>
+                  </div>
+                  {isLimitReached && (
+                    <span className="badge badge-warning self-start sm:self-center">
+                      1/1 Free Project Used
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Issues List or Pass State */}
