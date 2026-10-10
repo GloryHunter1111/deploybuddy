@@ -68,6 +68,30 @@ const STANDARD_SYSTEM_ENV_VARS = new Set([
   'DEV',
   'SSR',
   'PUBLIC_URL',
+  'TMPDIR',
+  'TMP',
+  'TEMP',
+  'HOME',
+  'USER',
+  'USERNAME',
+  'PATH',
+  'PWD',
+  'SHELL',
+  'LANG',
+  'TERM',
+  'HOSTNAME',
+  'CI',
+  'PORT',
+  'NODE_OPTIONS',
+  'NEXT_RUNTIME',
+  'VERCEL',
+  'VERCEL_ENV',
+  'VERCEL_URL',
+  'NETLIFY',
+  'URL',
+  'DEPLOY_URL',
+  'DEPLOY_PRIME_URL',
+  'DISABLE_HMR',
 ])
 
 const PLACEHOLDER_ENV_NAMES = new Set([
@@ -151,6 +175,21 @@ const EXCLUDED_ENV_DIRS = new Set([
   'docs',
   'e2e',
 ])
+
+function isConfigFile(filePath: string): boolean {
+  const fileName = filePath.split('/').pop()?.toLowerCase() || ''
+  if (
+    fileName.startsWith('vite.config.') ||
+    fileName.startsWith('next.config.') ||
+    fileName.startsWith('tailwind.config.') ||
+    fileName.startsWith('postcss.config.') ||
+    fileName.startsWith('eslint.config.') ||
+    /\.config\.(js|ts|mjs|cjs)$/i.test(fileName)
+  ) {
+    return true
+  }
+  return false
+}
 
 function isValidEnvVarName(name: string): boolean {
   if (!name || name.length < 2) return false
@@ -605,11 +644,31 @@ export async function analyzeRepository(
     )
   })
 
-  const envExampleItem = fileTree.find((f) =>
-    ['.env.example', '.env.sample', '.env.template', '.env.local.example'].includes(
-      f.path.split('/').pop()?.toLowerCase() || '',
-    ),
-  )
+  // Find all example env files anywhere in tree (up to 5)
+  const exampleEnvItems = fileTree
+    .filter((f) => {
+      const fileName = f.path.split('/').pop()?.toLowerCase() || ''
+      return ['.env.example', '.env.sample', '.env.template', '.env.local.example'].includes(fileName)
+    })
+    .slice(0, 5)
+
+  const documentedEnvVarsSet = new Set<string>()
+  for (const item of exampleEnvItems) {
+    const raw = await source.getFile(item.path)
+    if (raw) {
+      for (const line of raw.split(/\r?\n/)) {
+        const trimmed = line.trim()
+        if (trimmed && !trimmed.startsWith('#')) {
+          const key = trimmed.split('=')[0]?.trim()
+          if (key && isValidEnvVarName(key)) {
+            documentedEnvVarsSet.add(key)
+          }
+        }
+      }
+    }
+  }
+  const documentedEnvVars = Array.from(documentedEnvVarsSet).sort()
+  const envExampleExists = exampleEnvItems.length > 0
 
   // Fetch root .gitignore once to check for unignored files
   const gitignoreRaw = await source.getFile('.gitignore')
@@ -702,11 +761,6 @@ export async function analyzeRepository(
     netlifyTomlRaw = await source.getFile(netlifyTomlItem.path)
   }
 
-  let envExampleRaw: string | null = null
-  if (envExampleItem) {
-    envExampleRaw = await source.getFile(envExampleItem.path)
-  }
-
   // 6. Read Source Files in Parallel Batches
   const fileContentsMap = new Map<string, string>()
   const BATCH_SIZE = 5
@@ -748,7 +802,9 @@ export async function analyzeRepository(
   }
   const hasClientRouter = Object.keys(primaryDeps).some((d) => CLIENT_ROUTERS.has(d))
 
-  const referencedEnvVarsSet = new Set<string>()
+  // Track referenced environment variables and occurrences across non-config files
+  const varOccurrences = new Map<string, { total: number; withDefault: number }>()
+  const aliasGroups: Set<string>[] = []
 
   const secretPatterns = [
     { name: 'OpenAI Project API Key', regex: /\b(sk-proj-[a-zA-Z0-9_-]{48,})\b/g },
@@ -765,24 +821,49 @@ export async function analyzeRepository(
   fileContentsMap.forEach((rawContent, filePath) => {
     const cleanedContent = stripComments(rawContent)
 
-    const dotImportMatches = cleanedContent.matchAll(/\bimport\.meta\.env\.([A-Z][A-Z0-9_]*[A-Z0-9])\b/g)
-    for (const match of dotImportMatches) {
-      if (isValidEnvVarName(match[1])) {
-        referencedEnvVarsSet.add(match[1])
-      }
-    }
+    // Ignore variables referenced ONLY in tooling or config files
+    if (!isConfigFile(filePath)) {
+      const envRegex = /(?:import\.meta\.env|process\.env)(?:\.([A-Z][A-Z0-9_]*[A-Z0-9])|\[['"]([A-Z][A-Z0-9_]*[A-Z0-9])['"]\])/g
+      let match: RegExpExecArray | null
 
-    const dotProcessMatches = cleanedContent.matchAll(/\bprocess\.env\.([A-Z][A-Z0-9_]*[A-Z0-9])\b/g)
-    for (const match of dotProcessMatches) {
-      if (isValidEnvVarName(match[1])) {
-        referencedEnvVarsSet.add(match[1])
-      }
-    }
+      while ((match = envRegex.exec(cleanedContent)) !== null) {
+        const name = match[1] || match[2]
+        if (!isValidEnvVarName(name) || STANDARD_SYSTEM_ENV_VARS.has(name)) {
+          continue
+        }
 
-    const bracketMatches = cleanedContent.matchAll(/\b(?:import\.meta\.env|process\.env)\[['"]([A-Z][A-Z0-9_]*[A-Z0-9])['"]\]/g)
-    for (const match of bracketMatches) {
-      if (isValidEnvVarName(match[1])) {
-        referencedEnvVarsSet.add(match[1])
+        const matchEnd = match.index + match[0].length
+        const after = cleanedContent.slice(matchEnd).trimStart()
+        let hasDefault = false
+
+        if (after.startsWith('||') || after.startsWith('??')) {
+          const rest = after.slice(2).trimStart()
+          const nextEnvMatch = rest.match(
+            /^(?:import\.meta\.env|process\.env)(?:\.([A-Z][A-Z0-9_]*[A-Z0-9])|\[['"]([A-Z][A-Z0-9_]*[A-Z0-9])['"]\])/,
+          )
+          if (nextEnvMatch) {
+            const nextName = nextEnvMatch[1] || nextEnvMatch[2]
+            if (isValidEnvVarName(nextName) && !STANDARD_SYSTEM_ENV_VARS.has(nextName)) {
+              // Add to alias groups
+              let foundGroup = aliasGroups.find((g) => g.has(name) || g.has(nextName))
+              if (!foundGroup) {
+                foundGroup = new Set<string>()
+                aliasGroups.push(foundGroup)
+              }
+              foundGroup.add(name)
+              foundGroup.add(nextName)
+            }
+          } else {
+            hasDefault = true
+          }
+        }
+
+        const currentOcc = varOccurrences.get(name) || { total: 0, withDefault: 0 }
+        currentOcc.total += 1
+        if (hasDefault) {
+          currentOcc.withDefault += 1
+        }
+        varOccurrences.set(name, currentOcc)
       }
     }
 
@@ -897,9 +978,16 @@ export async function analyzeRepository(
     }
   }
 
+  // Filter referenced variables: exclude variables where every occurrence has an inline default (optional)
+  const referencedEnvVarsList: string[] = []
+  for (const [name, stats] of varOccurrences.entries()) {
+    if (stats.total > stats.withDefault) {
+      referencedEnvVarsList.push(name)
+    }
+  }
+  const referencedEnvVars = referencedEnvVarsList.sort()
+
   let hasSpaRedirect = false
-  const referencedEnvVars = Array.from(referencedEnvVarsSet).sort()
-  const documentedEnvVars: string[] = []
 
   if (!hasDeployableWebApp) {
     framework = 'unknown'
@@ -1032,20 +1120,17 @@ export async function analyzeRepository(
       })
     }
 
-    // Check 3: Missing or incomplete .env.example
-    if (envExampleRaw) {
-      const lines = envExampleRaw.split(/\r?\n/)
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (trimmed && !trimmed.startsWith('#')) {
-          const key = trimmed.split('=')[0]?.trim()
-          if (key && isValidEnvVarName(key)) {
-            documentedEnvVars.push(key)
-          }
+    // Check 3: Environment variables & .env.example accuracy
+    if (envExampleExists) {
+      const missingInExample = referencedEnvVars.filter((v) => {
+        if (documentedEnvVarsSet.has(v)) return false
+        const group = aliasGroups.find((g) => g.has(v))
+        if (group && Array.from(group).some((member) => documentedEnvVarsSet.has(member))) {
+          return false
         }
-      }
+        return true
+      })
 
-      const missingInExample = referencedEnvVars.filter((v) => !documentedEnvVars.includes(v))
       if (missingInExample.length > 0) {
         issues.push({
           severity: 'info',
@@ -1054,18 +1139,12 @@ export async function analyzeRepository(
           snippet: `# Add missing variables to .env.example:\n${missingInExample.map((v) => `${v}=`).join('\n')}`,
         })
       }
-    } else {
-      const envSnippet = referencedEnvVars.length > 0
-        ? `# .env.example — Copy to .env.local and populate\n${referencedEnvVars.map((v) => `${v}=`).join('\n')}`
-        : `# .env.example — Copy to .env.local and populate\nVITE_SUPABASE_URL=\nVITE_SUPABASE_ANON_KEY=`
-
+    } else if (referencedEnvVars.length > 0) {
       issues.push({
         severity: 'info',
         title: 'Missing .env.example template',
-        description: referencedEnvVars.length > 0
-          ? `Your codebase references ${referencedEnvVars.length} environment variable${referencedEnvVars.length > 1 ? 's' : ''} (${referencedEnvVars.join(', ')}), but no .env.example file was found in the repository root. Adding one helps deployment platforms and collaborators identify required values.`
-          : `No .env.example template file was found. Adding one provides a documented template for environment variables required by your app.`,
-        snippet: envSnippet,
+        description: `Your codebase references ${referencedEnvVars.length} environment variable${referencedEnvVars.length > 1 ? 's' : ''} (${referencedEnvVars.join(', ')}), but no .env.example file was found in the repository root. Adding one helps deployment platforms and collaborators identify required values.`,
+        snippet: `# .env.example — Copy to .env.local and populate\n${referencedEnvVars.map((v) => `${v}=`).join('\n')}`,
       })
     }
   }
@@ -1094,7 +1173,7 @@ export async function analyzeRepository(
       buildScriptCommand: hasDeployableWebApp ? buildScriptCommand : undefined,
       netlifyTomlExists: Boolean(netlifyTomlItem),
       hasSpaRedirect,
-      envExampleExists: Boolean(envExampleItem),
+      envExampleExists,
       referencedEnvVars,
       documentedEnvVars,
       scannedFilesCount: selectedSourceFiles.length + (primaryAppDetail ? 1 : 0) + (netlifyTomlItem ? 1 : 0),
