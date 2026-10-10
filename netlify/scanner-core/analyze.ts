@@ -139,12 +139,54 @@ const EXCLUDED_DIR_SEGMENTS = new Set([
   'example',
 ])
 
+const EXCLUDED_ENV_DIRS = new Set([
+  'fixtures',
+  '__fixtures__',
+  'test',
+  'tests',
+  '__tests__',
+  'examples',
+  'example',
+  'samples',
+  'docs',
+  'e2e',
+])
+
 function isValidEnvVarName(name: string): boolean {
   if (!name || name.length < 2) return false
   if (name.endsWith('_')) return false
   if (STANDARD_SYSTEM_ENV_VARS.has(name)) return false
   if (PLACEHOLDER_ENV_NAMES.has(name)) return false
   return /^[A-Z][A-Z0-9_]*[A-Z0-9]$/.test(name)
+}
+
+function isRealLookingEnvValue(val: string): boolean {
+  const trimmed = val.trim().replace(/^['"]|['"]$/g, '')
+  if (!trimmed) return false
+  const lower = trimmed.toLowerCase()
+  if (
+    lower.includes('your_') ||
+    lower.includes('changeme') ||
+    lower.includes('change_me') ||
+    lower.includes('xxx') ||
+    lower.includes('example') ||
+    lower.includes('placeholder') ||
+    lower.includes('<') ||
+    lower === 'true' ||
+    lower === 'false' ||
+    /^\d+$/.test(trimmed)
+  ) {
+    return false
+  }
+  return true
+}
+
+function isSecretLikeEnvName(name: string): boolean {
+  const isSecret = /(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|API_?KEY|SERVICE_?ROLE|DATABASE_URL|DB_URL|CREDENTIAL|JWT|SALT)/i.test(
+    name,
+  )
+  const isPublic = /(ANON|PUBLISHABLE|PUBLIC_?KEY)/i.test(name)
+  return isSecret && !isPublic
 }
 
 function stripComments(code: string): string {
@@ -569,20 +611,46 @@ export async function analyzeRepository(
     ),
   )
 
+  // Fetch root .gitignore once to check for unignored files
+  const gitignoreRaw = await source.getFile('.gitignore')
+  const unignoredEnvPaths = new Set<string>()
+  if (gitignoreRaw) {
+    for (const line of gitignoreRaw.split(/\r?\n/)) {
+      const trimmed = line.trim()
+      if (trimmed.startsWith('!')) {
+        const pattern = trimmed.slice(1).trim().replace(/^\.?\//, '')
+        if (pattern) {
+          unignoredEnvPaths.add(pattern.toLowerCase())
+        }
+      }
+    }
+  }
+
+  // 3. Locate committed .env files (excluding test, fixture, example, docs, e2e directories)
   const committedEnvItems = fileTree.filter((f) => {
-    const lower = f.path.toLowerCase()
-    return (
-      lower === '.env' ||
-      lower === '.env.local' ||
-      lower === '.env.production' ||
-      lower === '.env.staging' ||
-      lower === '.env.development' ||
-      lower.endsWith('/.env') ||
-      lower.endsWith('/.env.local')
-    )
+    const parts = f.path.split('/')
+    const fileName = parts.pop()?.toLowerCase() || ''
+    if (
+      fileName.endsWith('.example') ||
+      fileName.endsWith('.sample') ||
+      fileName.endsWith('.template')
+    ) {
+      return false
+    }
+    const isEnv = fileName === '.env' || fileName.startsWith('.env.')
+    if (!isEnv) return false
+    const segments = parts.map((s) => s.toLowerCase())
+    return !segments.some((seg) => EXCLUDED_ENV_DIRS.has(seg))
   })
 
-  // 3. Filter Source Files for scanning
+  // Filter out any files explicitly unignored with ! in .gitignore
+  const envFilesToScan = committedEnvItems.filter(
+    (f) =>
+      !unignoredEnvPaths.has(f.path.toLowerCase()) &&
+      !unignoredEnvPaths.has(f.path.replace(/^\.?\//, '').toLowerCase()),
+  )
+
+  // 4. Filter Source Files for scanning
   const ignoredPatterns = [
     /node_modules\//i,
     /dist\//i,
@@ -628,7 +696,7 @@ export async function analyzeRepository(
 
   const selectedSourceFiles = prioritizedSourceFiles.slice(0, 20)
 
-  // 4. Read Key Files
+  // 5. Read Key Files
   let netlifyTomlRaw: string | null = null
   if (netlifyTomlItem) {
     netlifyTomlRaw = await source.getFile(netlifyTomlItem.path)
@@ -639,7 +707,7 @@ export async function analyzeRepository(
     envExampleRaw = await source.getFile(envExampleItem.path)
   }
 
-  // 5. Read Source Files in Parallel Batches
+  // 6. Read Source Files in Parallel Batches
   const fileContentsMap = new Map<string, string>()
   const BATCH_SIZE = 5
   for (let i = 0; i < selectedSourceFiles.length; i += BATCH_SIZE) {
@@ -658,7 +726,7 @@ export async function analyzeRepository(
     )
   }
 
-  // 6. Diagnostics
+  // 7. Diagnostics
   const issues: ScanIssue[] = []
 
   let detectedFrameworkResult = detectFramework(primaryApp, fileTree, primaryAppDir)
@@ -778,14 +846,55 @@ export async function analyzeRepository(
     }
   })
 
-  if (committedEnvItems.length > 0) {
-    const committedNames = committedEnvItems.map((f) => f.path).join(', ')
-    issues.push({
-      severity: 'warning',
-      title: `Sensitive environment file committed to git (${committedNames})`,
-      description: `The repository contains committed environment file(s) (${committedNames}). Actual environment files containing secrets or project credentials should be listed in .gitignore and never committed to version control.`,
-      snippet: `# Add environment files to your .gitignore:\n.env\n.env.local\n.env.*.local\n*.env`,
-    })
+  // 8. Committed .env files diagnostics (up to 5 files)
+  for (const envFile of envFilesToScan.slice(0, 5)) {
+    const rawContent = await source.getFile(envFile.path)
+    const exposedSecrets: string[] = []
+    let hasSupabaseServiceRole = false
+
+    if (rawContent) {
+      for (const line of rawContent.split(/\r?\n/)) {
+        const trimmed = line.trim()
+        if (!trimmed || trimmed.startsWith('#')) continue
+        const equalIdx = trimmed.indexOf('=')
+        if (equalIdx === -1) continue
+        const name = trimmed.slice(0, equalIdx).trim()
+        const value = trimmed.slice(equalIdx + 1).trim()
+
+        if (isSecretLikeEnvName(name) && isRealLookingEnvValue(value)) {
+          exposedSecrets.push(name)
+          if (name.toUpperCase().includes('SUPABASE') && name.toUpperCase().includes('SERVICE_ROLE')) {
+            hasSupabaseServiceRole = true
+          }
+        }
+      }
+    }
+
+    if (hasSupabaseServiceRole) {
+      issues.push({
+        severity: 'critical',
+        title: `Supabase service-role key committed in ${envFile.path}`,
+        description: `The committed environment file "${envFile.path}" contains an exposed Supabase service-role key (${exposedSecrets.join(', ')}). Anyone with access to this public repository or its commit history can read these credentials, which bypass all Row Level Security (RLS) policies. Deleting the file or making the repository private is not enough: you must rotate (revoke and replace) the key in your Supabase dashboard (Project Settings > API).`,
+        snippet: `# 1) Rotate the exposed key in your provider's dashboard:\n# For Supabase: Project Settings > API > Service Role Key (Revoke and roll)\n# 2) Stop tracking the file:\ngit rm --cached ${envFile.path}\n# 3) Add these lines to .gitignore:\n.env\n.env.local\n.env.*.local`,
+        filePath: envFile.path,
+      })
+    } else if (exposedSecrets.length > 0) {
+      issues.push({
+        severity: 'warning',
+        title: `Secrets committed in ${envFile.path}`,
+        description: `The committed environment file "${envFile.path}" contains exposed secret variable(s): ${exposedSecrets.join(', ')}. Anyone with access to this public repository or its commit history can read these values. Deleting the file is not enough: you must rotate (revoke and replace) the exposed keys in your provider's dashboard.`,
+        snippet: `# 1) Rotate the exposed key in your provider's dashboard\n# 2) Stop tracking the file:\ngit rm --cached ${envFile.path}\n# 3) Add these lines to .gitignore:\n.env\n.env.local\n.env.*.local`,
+        filePath: envFile.path,
+      })
+    } else {
+      issues.push({
+        severity: 'info',
+        title: `Environment file committed (${envFile.path}): no secrets detected`,
+        description: `The environment file "${envFile.path}" is committed to git. No sensitive API keys or credentials were detected, but actual environment files should typically be listed in .gitignore and kept local.`,
+        snippet: `# Stop tracking the file:\ngit rm --cached ${envFile.path}\n# Add environment files to your .gitignore:\n.env\n.env.local\n.env.*.local`,
+        filePath: envFile.path,
+      })
+    }
   }
 
   let hasSpaRedirect = false
