@@ -113,6 +113,16 @@ const WEB_FRAMEWORKS = new Set([
   '@tanstack/start',
 ])
 
+const CLIENT_ROUTERS = new Set([
+  'react-router',
+  'react-router-dom',
+  '@tanstack/react-router',
+  'wouter',
+  'vue-router',
+  'svelte-routing',
+  '@reach/router',
+])
+
 const EXCLUDED_DIR_SEGMENTS = new Set([
   'node_modules',
   'dist',
@@ -163,6 +173,99 @@ function maskSecret(secret: string): string {
   const prefix = secret.slice(0, 7)
   const suffix = secret.slice(-4)
   return `${prefix}••••${suffix}`
+}
+
+// Detects hosting targets and configurations other than default Netlify
+function detectHostingTarget(
+  fileTree: RepoTreeItem[],
+  pkgJson: Record<string, unknown> | null,
+  primaryAppDir = '',
+): {
+  host: 'netlify' | 'vercel' | 'cloudflare' | 'render' | 'fly' | 'railway' | 'docker' | 'unknown'
+  evidence: string
+  hostDisplayName: string
+} {
+  const filePaths = new Set(fileTree.map((f) => f.path.toLowerCase()))
+  const dirPrefix = primaryAppDir ? `${primaryAppDir.toLowerCase()}/` : ''
+  const scripts = (pkgJson?.scripts as Record<string, string>) || {}
+
+  // If netlify.toml exists at root or primaryAppDir, owner opted into Netlify
+  if (filePaths.has('netlify.toml') || (primaryAppDir && filePaths.has(`${dirPrefix}netlify.toml`))) {
+    return { host: 'netlify', evidence: 'netlify.toml', hostDisplayName: 'Netlify' }
+  }
+
+  // Vercel
+  if (filePaths.has('vercel.json') || (primaryAppDir && filePaths.has(`${dirPrefix}vercel.json`))) {
+    return { host: 'vercel', evidence: 'vercel.json', hostDisplayName: 'Vercel' }
+  }
+  if (scripts['vercel-build']) {
+    return { host: 'vercel', evidence: 'vercel-build script', hostDisplayName: 'Vercel' }
+  }
+
+  // Cloudflare
+  for (const name of ['wrangler.toml', 'wrangler.json', 'wrangler.jsonc']) {
+    if (filePaths.has(name) || (primaryAppDir && filePaths.has(`${dirPrefix}${name}`))) {
+      return { host: 'cloudflare', evidence: name, hostDisplayName: 'Cloudflare' }
+    }
+  }
+
+  // Render
+  if (filePaths.has('render.yaml') || (primaryAppDir && filePaths.has(`${dirPrefix}render.yaml`))) {
+    return { host: 'render', evidence: 'render.yaml', hostDisplayName: 'Render' }
+  }
+
+  // Fly.io
+  if (filePaths.has('fly.toml') || (primaryAppDir && filePaths.has(`${dirPrefix}fly.toml`))) {
+    return { host: 'fly', evidence: 'fly.toml', hostDisplayName: 'Fly.io' }
+  }
+
+  // Railway
+  for (const name of ['railway.json', 'railway.toml']) {
+    if (filePaths.has(name) || (primaryAppDir && filePaths.has(`${dirPrefix}${name}`))) {
+      return { host: 'railway', evidence: name, hostDisplayName: 'Railway' }
+    }
+  }
+
+  // Docker (only if no other host signal)
+  if (filePaths.has('dockerfile') || (primaryAppDir && filePaths.has(`${dirPrefix}dockerfile`))) {
+    return { host: 'docker', evidence: 'Dockerfile', hostDisplayName: 'container-based hosting' }
+  }
+
+  return { host: 'unknown', evidence: '', hostDisplayName: 'unknown' }
+}
+
+// Detects whether the primary application uses server-side rendering
+function detectServerRendering(
+  pkgJson: Record<string, unknown> | null,
+): { serverRendered: boolean; label: string } {
+  const allDeps: Record<string, string> = {
+    ...((pkgJson?.dependencies as Record<string, string>) || {}),
+    ...((pkgJson?.devDependencies as Record<string, string>) || {}),
+  }
+
+  if (allDeps['next']) return { serverRendered: true, label: 'Next.js' }
+  if (allDeps['@react-router/dev']) return { serverRendered: true, label: 'React Router' }
+  if (allDeps['@tanstack/react-start'] || allDeps['@tanstack/start'])
+    return { serverRendered: true, label: 'TanStack Start' }
+  if (allDeps['@sveltejs/kit']) return { serverRendered: true, label: 'SvelteKit' }
+  if (allDeps['@remix-run/dev'] || allDeps['@remix-run/node']) return { serverRendered: true, label: 'Remix' }
+  if (allDeps['nuxt'] || allDeps['nuxt3']) return { serverRendered: true, label: 'Nuxt' }
+
+  return { serverRendered: false, label: '' }
+}
+
+// Checks if a netlify.toml has a valid fallback SPA redirect rule
+function checkSpaRedirect(netlifyTomlRaw: string): boolean {
+  const blocks = netlifyTomlRaw.split(/\[\[redirects\]\]/i).slice(1)
+  for (const block of blocks) {
+    const blockContent = block.split(/\n\s*\[/)[0]
+    const hasIndexTo = /to\s*=\s*['"][^'"]*index\.html['"]/i.test(blockContent)
+    const hasStatus200 = /status\s*=\s*200\b/i.test(blockContent)
+    if (hasIndexTo && hasStatus200) {
+      return true
+    }
+  }
+  return false
 }
 
 function detectFramework(
@@ -433,8 +536,7 @@ export async function analyzeRepository(
       ...((primaryAppDetail.content.devDependencies as Record<string, string>) || {}),
     }
     const hasWebFramework = Object.keys(deps).some((d) => WEB_FRAMEWORKS.has(d))
-    
-    // Check if it's a library without framework deps
+
     const isLibrary = Boolean(
       (primaryAppDetail.content.main || primaryAppDetail.content.module || primaryAppDetail.content.exports) &&
       (primaryAppDetail.content.peerDependencies || Array.isArray(primaryAppDetail.content.files)) &&
@@ -568,6 +670,15 @@ export async function analyzeRepository(
   const scripts = (primaryApp?.scripts as Record<string, string>) || {}
   const hasBuildScript = Boolean(scripts.build)
   const buildScriptCommand = scripts.build
+
+  const hostingTarget = detectHostingTarget(fileTree, primaryApp, primaryAppDir)
+  const { serverRendered, label: ssrLabel } = detectServerRendering(primaryApp)
+
+  const primaryDeps: Record<string, string> = {
+    ...((primaryApp?.dependencies as Record<string, string>) || {}),
+    ...((primaryApp?.devDependencies as Record<string, string>) || {}),
+  }
+  const hasClientRouter = Object.keys(primaryDeps).some((d) => CLIENT_ROUTERS.has(d))
 
   const referencedEnvVarsSet = new Set<string>()
 
@@ -704,21 +815,50 @@ export async function analyzeRepository(
 
     // Check 1: netlify.toml Checks
     if (!netlifyTomlItem) {
-      issues.push({
-        severity: 'warning',
-        title: 'Missing netlify.toml configuration',
-        description: `No netlify.toml configuration file was found in the repository root. Without it, Netlify may fail to build your project or return 404 errors when users refresh client-side routes.`,
-        snippet: generateRecommendedNetlifyToml(framework, buildScriptCommand ? 'npm run build' : defaultBuildCommand),
-      })
+      if (hostingTarget.host !== 'unknown' && hostingTarget.host !== 'netlify') {
+        const snippetText =
+          hostingTarget.host === 'docker'
+            ? '# No change needed if you deploy with Docker.'
+            : `# No change needed if you deploy to ${hostingTarget.hostDisplayName}.`
+
+        issues.push({
+          severity: 'info',
+          title: `This repository looks set up for ${hostingTarget.hostDisplayName}`,
+          description: `Found ${hostingTarget.evidence}. A netlify.toml is only needed if you plan to deploy to Netlify.`,
+          snippet: snippetText,
+        })
+      } else if (framework === 'next') {
+        issues.push({
+          severity: 'info',
+          title: 'netlify.toml is optional for Next.js',
+          description:
+            'Netlify supports Next.js natively and sets up its runtime automatically for new sites, so a netlify.toml is usually unnecessary. Add one only to configure settings such as a specific Node.js version.',
+          snippet:
+            '# Netlify configures Next.js automatically.\n# Add a netlify.toml only for custom build options or environment settings.',
+        })
+      } else if (serverRendered) {
+        issues.push({
+          severity: 'info',
+          title: 'netlify.toml: follow the framework guide',
+          description: `This looks like a server-rendered ${ssrLabel} app. A static-site config (publish = "dist" with a /* redirect) would break server rendering; follow Netlify's framework guide.`,
+          snippet: `# Follow Netlify's framework guide for deploying ${ssrLabel} apps.`,
+        })
+      } else {
+        issues.push({
+          severity: 'warning',
+          title: 'Missing netlify.toml configuration',
+          description: `No netlify.toml configuration file was found in the repository root. Without it, Netlify may fail to build your project or return 404 errors when users refresh client-side routes.`,
+          snippet: generateRecommendedNetlifyToml(
+            framework,
+            buildScriptCommand ? 'npm run build' : defaultBuildCommand,
+          ),
+        })
+      }
     } else if (netlifyTomlRaw) {
-      const hasRedirectBlock = /\[\[redirects\]\]/i.test(netlifyTomlRaw)
-      const hasIndexRedirect = /from\s*=\s*['"]\/\*['"][\s\S]*?to\s*=\s*['"]\/index\.html['"]/i.test(netlifyTomlRaw) ||
-        /from\s*=\s*['"]\/\*['"][\s\S]*?status\s*=\s*200/i.test(netlifyTomlRaw)
+      hasSpaRedirect = checkSpaRedirect(netlifyTomlRaw)
 
-      hasSpaRedirect = hasRedirectBlock && hasIndexRedirect
-
-      const isSpa = ['vite', 'cra', 'vue', 'svelte'].includes(framework)
-      if (isSpa && !hasSpaRedirect) {
+      // Only check SPA redirect if serverRendered is false and client router is present
+      if (!serverRendered && hasClientRouter && !hasSpaRedirect) {
         issues.push({
           severity: 'warning',
           title: 'Missing SPA redirect rule in netlify.toml',
@@ -746,7 +886,8 @@ export async function analyzeRepository(
         }
       }
 
-      if (publishMatch && publishMatch[1]) {
+      // Skip publish-directory mismatch check when serverRendered is true
+      if (!serverRendered && publishMatch && publishMatch[1]) {
         const publishDir = publishMatch[1].trim()
         if (framework === 'vite' && publishDir === 'build') {
           issues.push({
