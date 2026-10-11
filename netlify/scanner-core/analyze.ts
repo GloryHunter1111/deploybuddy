@@ -256,6 +256,30 @@ function maskSecret(secret: string): string {
   return `${prefix}••••${suffix}`
 }
 
+function isSensitiveDefaultSecretName(name: string): boolean {
+  const isSecret = /(SECRET|TOKEN|PASSWORD|API_?KEY|JWT|SALT)/i.test(name)
+  const isPublic = /(ANON|PUBLISHABLE|PUBLIC)/i.test(name)
+  return isSecret && !isPublic
+}
+
+function isPredictableSecretFallback(val: string): boolean {
+  if (!val || val.length < 8) return false
+  const lower = val.toLowerCase()
+  if (lower.includes('localhost')) return false
+  if (lower.includes('example')) return false
+  if (lower.includes('changeme')) return false
+  if (lower.includes('your_')) return false
+  return true
+}
+
+function isTestFilePath(filePath: string): boolean {
+  const lower = filePath.toLowerCase()
+  return (
+    /(?:^|\/)(?:test|tests|__tests__|fixtures|spec)(?:\/|$)/.test(lower) ||
+    /\.(?:test|spec)\.[a-z0-9]+$/i.test(lower)
+  )
+}
+
 // Detects hosting targets and configurations other than default Netlify
 function detectHostingTarget(
   fileTree: RepoTreeItem[],
@@ -871,6 +895,8 @@ export async function analyzeRepository(
     { name: 'Google API Key', regex: /\b(AIza[0-9A-Za-z-_]{35})\b/g },
   ]
 
+  const predictableSecretIssues: ScanIssue[] = []
+
   // Scan source files for env vars and hardcoded secrets
   fileContentsMap.forEach((rawContent, filePath) => {
     const cleanedContent = stripComments(rawContent)
@@ -909,6 +935,46 @@ export async function analyzeRepository(
             }
           } else {
             hasDefault = true
+            if (!isTestFilePath(filePath) && isSensitiveDefaultSecretName(name)) {
+              const strMatch = rest.match(/^(['"`])((?:\\.|(?!\1)[^\\\r\n])*)\1/)
+              if (strMatch && isPredictableSecretFallback(strMatch[2])) {
+                if (
+                  predictableSecretIssues.length < 3 &&
+                  !predictableSecretIssues.some((issue) => issue.title === `Predictable default for ${name}`)
+                ) {
+                  predictableSecretIssues.push({
+                    severity: 'warning',
+                    title: `Predictable default for ${name}`,
+                    description: `Source file ${filePath} falls back to a hardcoded string when ${name} is not set. If deployed without this variable configured, the app will use this predictable value in production.`,
+                    snippet: `// In ${filePath}:\n// Replace the fallback with an explicit check that throws at boot:\nif (!process.env.${name}) {\n  throw new Error('${name} must be set in production')\n}`,
+                    filePath,
+                  })
+                }
+              }
+            }
+          }
+        } else if (after.startsWith('?')) {
+          const ternaryMatch = after.match(
+            /^\?\s*(?:(?:process\.env|import\.meta\.env)(?:\.[A-Za-z0-9_]+|\[['"][^'"]+['"]\])\s*)?:\s*(['"`])((?:\\.|(?!\1)[^\\\r\n])*)\1/,
+          )
+          if (ternaryMatch) {
+            hasDefault = true
+            if (!isTestFilePath(filePath) && isSensitiveDefaultSecretName(name)) {
+              if (isPredictableSecretFallback(ternaryMatch[2])) {
+                if (
+                  predictableSecretIssues.length < 3 &&
+                  !predictableSecretIssues.some((issue) => issue.title === `Predictable default for ${name}`)
+                ) {
+                  predictableSecretIssues.push({
+                    severity: 'warning',
+                    title: `Predictable default for ${name}`,
+                    description: `Source file ${filePath} falls back to a hardcoded string when ${name} is not set. If deployed without this variable configured, the app will use this predictable value in production.`,
+                    snippet: `// In ${filePath}:\n// Replace the fallback with an explicit check that throws at boot:\nif (!process.env.${name}) {\n  throw new Error('${name} must be set in production')\n}`,
+                    filePath,
+                  })
+                }
+              }
+            }
           }
         }
 
@@ -980,6 +1046,8 @@ export async function analyzeRepository(
       })
     }
   })
+
+  issues.push(...predictableSecretIssues)
 
   // 8. Committed .env files diagnostics (up to 5 files)
   for (const envFile of envFilesToScan.slice(0, 5)) {
