@@ -733,6 +733,7 @@ export async function analyzeRepository(
   ]
 
   const sourceFiles = fileTree
+    .filter((f) => !f.size || f.size <= 200 * 1024)
     .filter((f) => !ignoredPatterns.some((pattern) => pattern.test(f.path)))
     .filter((f) => /\.(jsx?|tsx?|vue|svelte|mjs|cjs|html|json)$/i.test(f.path))
 
@@ -740,20 +741,57 @@ export async function analyzeRepository(
     const score = (p: string) => {
       let s = 0
       const lp = p.toLowerCase()
-      if (primaryAppDir && lp.startsWith(primaryAppDir.toLowerCase() + '/')) {
-        s += 15
+      const fileName = p.split('/').pop()?.toLowerCase() || ''
+
+      // Tier 1: server, backend, function, middleware files
+      const isServerOrFunction =
+        lp.startsWith('netlify/functions/') ||
+        lp.includes('/netlify/functions/') ||
+        lp.startsWith('api/') ||
+        lp.includes('/api/') ||
+        lp.startsWith('server/') ||
+        lp.includes('/server/') ||
+        lp.startsWith('backend/') ||
+        lp.includes('/backend/') ||
+        lp.startsWith('src/server/') ||
+        lp.includes('/src/server/') ||
+        lp.startsWith('functions/') ||
+        lp.includes('/functions/') ||
+        fileName.includes('middleware')
+
+      if (isServerOrFunction) {
+        s += 100
       }
-      if (lp.includes('supabase') || lp.includes('client') || lp.includes('auth')) s += 10
-      if (lp.startsWith('src/lib') || lp.startsWith('src/services') || lp.startsWith('src/api')) s += 8
-      if (lp.startsWith('src/app') || lp.startsWith('src/pages') || lp.startsWith('src/routes')) s += 6
-      if (lp.startsWith('src/components') || lp.endsWith('/app.tsx') || lp.endsWith('/main.tsx')) s += 5
+
+      // Tier 2: names suggesting config, env, auth, supabase, client, db, webhook
+      const isKeyName =
+        fileName.includes('config') ||
+        fileName.includes('env') ||
+        fileName.includes('auth') ||
+        fileName.includes('supabase') ||
+        fileName.includes('client') ||
+        fileName.includes('db') ||
+        fileName.includes('webhook')
+
+      if (isKeyName) {
+        s += 50
+      }
+
+      // Tier 3: primaryAppDir boost and folder structure
+      if (primaryAppDir && lp.startsWith(primaryAppDir.toLowerCase() + '/')) {
+        s += 20
+      }
+      if (lp.startsWith('src/lib') || lp.startsWith('src/services')) s += 15
+      if (lp.startsWith('src/app') || lp.startsWith('src/pages') || lp.startsWith('src/routes')) s += 10
+      if (lp.startsWith('src/components') || lp.endsWith('/app.tsx') || lp.endsWith('/main.tsx')) s += 8
       if (lp.endsWith('.ts') || lp.endsWith('.tsx') || lp.endsWith('.js') || lp.endsWith('.jsx')) s += 3
+
       return s || 1
     }
     return score(b.path) - score(a.path)
   })
 
-  const selectedSourceFiles = prioritizedSourceFiles.slice(0, 20)
+  const selectedSourceFiles = prioritizedSourceFiles.slice(0, 40)
 
   // 5. Read Key Files
   let netlifyTomlRaw: string | null = null
@@ -761,10 +799,18 @@ export async function analyzeRepository(
     netlifyTomlRaw = await source.getFile(netlifyTomlItem.path)
   }
 
-  // 6. Read Source Files in Parallel Batches
+  // 6. Read Source Files in Parallel Batches of 10 with 7s timeout
   const fileContentsMap = new Map<string, string>()
-  const BATCH_SIZE = 5
+  const BATCH_SIZE = 10
+  const getNow = source.now ? () => source.now!() : () => Date.now()
+  const scanStartTime = getNow()
+  let filesSkippedDueToLimit = false
+
   for (let i = 0; i < selectedSourceFiles.length; i += BATCH_SIZE) {
+    if (i > 0 && getNow() - scanStartTime > 7000) {
+      filesSkippedDueToLimit = true
+      break
+    }
     const batch = selectedSourceFiles.slice(i, i + BATCH_SIZE)
     await Promise.all(
       batch.map(async (file) => {
@@ -773,11 +819,19 @@ export async function analyzeRepository(
           return
         }
         const content = await source.getFile(file.path)
-        if (content) {
+        if (content !== null && content !== undefined) {
           fileContentsMap.set(file.path, content)
         }
       }),
     )
+    if (i + BATCH_SIZE < selectedSourceFiles.length && getNow() - scanStartTime > 7000) {
+      filesSkippedDueToLimit = true
+      break
+    }
+  }
+
+  if (sourceFiles.length > selectedSourceFiles.length) {
+    filesSkippedDueToLimit = true
   }
 
   // 7. Diagnostics
@@ -1121,6 +1175,11 @@ export async function analyzeRepository(
     }
 
     // Check 3: Environment variables & .env.example accuracy
+    const scannedN = fileContentsMap.size
+    const limitSentence = filesSkippedDueToLimit
+      ? ` Scanned the ${scannedN} most relevant files; very large repositories may have more variables.`
+      : ''
+
     if (envExampleExists) {
       const missingInExample = referencedEnvVars.filter((v) => {
         if (documentedEnvVarsSet.has(v)) return false
@@ -1135,7 +1194,7 @@ export async function analyzeRepository(
         issues.push({
           severity: 'info',
           title: 'Undocumented environment variables in .env.example',
-          description: `Your source code references environment variable${missingInExample.length > 1 ? 's that are' : ' that is'} missing from .env.example: ${missingInExample.join(', ')}.`,
+          description: `Your source code references environment variable${missingInExample.length > 1 ? 's that are' : ' that is'} missing from .env.example: ${missingInExample.join(', ')}.${limitSentence}`,
           snippet: `# Add missing variables to .env.example:\n${missingInExample.map((v) => `${v}=`).join('\n')}`,
         })
       }
@@ -1143,7 +1202,7 @@ export async function analyzeRepository(
       issues.push({
         severity: 'info',
         title: 'Missing .env.example template',
-        description: `Your codebase references ${referencedEnvVars.length} environment variable${referencedEnvVars.length > 1 ? 's' : ''} (${referencedEnvVars.join(', ')}), but no .env.example file was found in the repository root. Adding one helps deployment platforms and collaborators identify required values.`,
+        description: `Your codebase references ${referencedEnvVars.length} environment variable${referencedEnvVars.length > 1 ? 's' : ''} (${referencedEnvVars.join(', ')}), but no .env.example file was found in the repository root. Adding one helps deployment platforms and collaborators identify required values.${limitSentence}`,
         snippet: `# .env.example — Copy to .env.local and populate\n${referencedEnvVars.map((v) => `${v}=`).join('\n')}`,
       })
     }

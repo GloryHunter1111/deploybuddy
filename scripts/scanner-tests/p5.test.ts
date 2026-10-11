@@ -64,10 +64,14 @@ test('[P5] C38 Graceful timeout after 7 seconds returns partial report', async (
     'src/late.ts': 'const b = process.env.MY_LATE_VAR',
   }
 
+  for (let i = 1; i <= 10; i++) {
+    files[`src/extra${i}.ts`] = `export const extra${i} = ${i}`
+  }
+
   const source = makeSource(files, {
     now: () => {
       // Advance virtual clock beyond 7000ms after first batch
-      virtualTime += 4000
+      virtualTime += 8000
       return virtualTime
     },
   })
