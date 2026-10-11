@@ -280,6 +280,128 @@ function isTestFilePath(filePath: string): boolean {
   )
 }
 
+function isToolingOrScriptFile(filePath: string): boolean {
+  const lower = filePath.toLowerCase()
+  const parts = lower.split('/')
+  const fileName = parts[parts.length - 1]
+  return (
+    parts.includes('scripts') ||
+    parts.includes('tools') ||
+    parts.includes('migrations') ||
+    parts.includes('prisma') ||
+    fileName.startsWith('seed')
+  )
+}
+
+function getWorkspaceFolder(filePath: string, candidateDirs: string[]): string | null {
+  const matchingCandidate = candidateDirs
+    .filter((dir) => dir.length > 0 && (filePath === dir || filePath.startsWith(`${dir}/`)))
+    .sort((a, b) => b.length - a.length)[0]
+  if (matchingCandidate) {
+    return matchingCandidate
+  }
+
+  const match = filePath.match(/^(apps\/[^/]+|packages\/[^/]+|services\/[^/]+|libs\/[^/]+|modules\/[^/]+)(?:\/|$)/)
+  if (match) {
+    return match[1]
+  }
+
+  return null
+}
+
+function formatEnvSnippet(
+  vars: string[],
+  varFilePaths: Map<string, Set<string>>,
+  candidateDirs: string[],
+  isMonorepo: boolean,
+  headerComment: string,
+): string {
+  const toolingVars: string[] = []
+  const hostVars: string[] = []
+
+  for (const v of vars) {
+    const paths = varFilePaths.get(v)
+    if (paths && paths.size > 0 && Array.from(paths).every((p) => isToolingOrScriptFile(p))) {
+      toolingVars.push(v)
+    } else {
+      hostVars.push(v)
+    }
+  }
+
+  if (isMonorepo) {
+    const workspaceMap = new Map<string, string[]>()
+    const sharedVars: string[] = []
+    const otherVars: string[] = []
+
+    for (const v of hostVars) {
+      const paths = varFilePaths.get(v) || new Set<string>()
+      const workspaces = new Set<string>()
+      for (const p of paths) {
+        if (!isToolingOrScriptFile(p)) {
+          const ws = getWorkspaceFolder(p, candidateDirs)
+          if (ws) workspaces.add(ws)
+        }
+      }
+
+      if (workspaces.size > 1) {
+        sharedVars.push(v)
+      } else if (workspaces.size === 1) {
+        const ws = Array.from(workspaces)[0]
+        if (!workspaceMap.has(ws)) {
+          workspaceMap.set(ws, [])
+        }
+        workspaceMap.get(ws)!.push(v)
+      } else {
+        otherVars.push(v)
+      }
+    }
+
+    const lines: string[] = [headerComment]
+    const sortedWorkspaces = Array.from(workspaceMap.keys()).sort()
+    for (const ws of sortedWorkspaces) {
+      lines.push('', `# ${ws}:`)
+      for (const v of workspaceMap.get(ws)!.sort()) {
+        lines.push(`${v}=`)
+      }
+    }
+
+    if (sharedVars.length > 0) {
+      lines.push('', '# Shared:')
+      for (const v of sharedVars.sort()) {
+        lines.push(`${v}=`)
+      }
+    }
+
+    if (otherVars.length > 0) {
+      lines.push('', '# General:')
+      for (const v of otherVars.sort()) {
+        lines.push(`${v}=`)
+      }
+    }
+
+    if (toolingVars.length > 0) {
+      lines.push('', '# Used only by scripts or tooling (probably not needed on your web host)')
+      for (const v of toolingVars.sort()) {
+        lines.push(`${v}=`)
+      }
+    }
+
+    return lines.join('\n').trim()
+  } else {
+    const lines: string[] = [headerComment]
+    for (const v of hostVars.sort()) {
+      lines.push(`${v}=`)
+    }
+    if (toolingVars.length > 0) {
+      lines.push('', '# Used only by scripts or tooling (probably not needed on your web host)')
+      for (const v of toolingVars.sort()) {
+        lines.push(`${v}=`)
+      }
+    }
+    return lines.join('\n').trim()
+  }
+}
+
 // Detects hosting targets and configurations other than default Netlify
 function detectHostingTarget(
   fileTree: RepoTreeItem[],
@@ -556,6 +678,13 @@ export async function analyzeRepository(
     // Exclude if any directory segment is in EXCLUDED_DIR_SEGMENTS
     return !parts.some((segment) => EXCLUDED_DIR_SEGMENTS.has(segment.toLowerCase()))
   })
+
+  const candidateDirs = packageCandidates
+    .map((f) => (f.path.includes('/') ? f.path.substring(0, f.path.lastIndexOf('/')) : ''))
+    .filter((d) => d.length > 0)
+  const isMonorepo =
+    candidateDirs.length > 0 ||
+    fileTree.some((f) => f.path.startsWith('apps/') || f.path.startsWith('packages/'))
 
   // Sort candidates: root first (depth 0), then shallowest first
   packageCandidates.sort((a, b) => {
@@ -882,6 +1011,7 @@ export async function analyzeRepository(
 
   // Track referenced environment variables and occurrences across non-config files
   const varOccurrences = new Map<string, { total: number; withDefault: number }>()
+  const varFilePaths = new Map<string, Set<string>>()
   const aliasGroups: Set<string>[] = []
 
   const secretPatterns = [
@@ -911,6 +1041,11 @@ export async function analyzeRepository(
         if (!isValidEnvVarName(name) || STANDARD_SYSTEM_ENV_VARS.has(name)) {
           continue
         }
+
+        if (!varFilePaths.has(name)) {
+          varFilePaths.set(name, new Set())
+        }
+        varFilePaths.get(name)!.add(filePath)
 
         const matchEnd = match.index + match[0].length
         const after = cleanedContent.slice(matchEnd).trimStart()
@@ -1263,7 +1398,13 @@ export async function analyzeRepository(
           severity: 'info',
           title: 'Undocumented environment variables in .env.example',
           description: `Your source code references environment variable${missingInExample.length > 1 ? 's that are' : ' that is'} missing from .env.example: ${missingInExample.join(', ')}.${limitSentence}`,
-          snippet: `# Add missing variables to .env.example:\n${missingInExample.map((v) => `${v}=`).join('\n')}`,
+          snippet: formatEnvSnippet(
+            missingInExample,
+            varFilePaths,
+            candidateDirs,
+            isMonorepo,
+            '# Add missing variables to .env.example:',
+          ),
         })
       }
     } else if (referencedEnvVars.length > 0) {
@@ -1271,7 +1412,13 @@ export async function analyzeRepository(
         severity: 'info',
         title: 'Missing .env.example template',
         description: `Your codebase references ${referencedEnvVars.length} environment variable${referencedEnvVars.length > 1 ? 's' : ''} (${referencedEnvVars.join(', ')}), but no .env.example file was found in the repository root. Adding one helps deployment platforms and collaborators identify required values.${limitSentence}`,
-        snippet: `# .env.example — Copy to .env.local and populate\n${referencedEnvVars.map((v) => `${v}=`).join('\n')}`,
+        snippet: formatEnvSnippet(
+          referencedEnvVars,
+          varFilePaths,
+          candidateDirs,
+          isMonorepo,
+          '# .env.example — Copy to .env.local and populate',
+        ),
       })
     }
   }
