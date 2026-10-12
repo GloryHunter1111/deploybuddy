@@ -222,8 +222,8 @@ export function ScanPage() {
               </div>
 
               <div className="flex flex-wrap items-center gap-2">
-                {report.issues.length === 0 ? (
-                  <span className="badge badge-success">0 Issues • Ready to deploy</span>
+                {report.issues.length === 0 && !report.issues.some((i) => i.title === 'No deployable web app detected') ? (
+                  <span className="badge badge-success">NO ISSUES FOUND</span>
                 ) : (
                   <>
                     {criticalCount > 0 && <span className="badge badge-critical">{criticalCount} Critical</span>}
@@ -316,14 +316,14 @@ export function ScanPage() {
           </div>
 
           {/* Issues List or Pass State */}
-          {report.issues.length === 0 ? (
+          {report.issues.length === 0 && !report.issues.some((i) => i.title === 'No deployable web app detected') ? (
             <div className="rounded-2xl border border-lime-400/20 bg-zinc-900/50 p-8 text-center">
               <div className="mx-auto grid size-12 place-items-center rounded-xl bg-lime-400/10 font-mono text-lime-300">
                 ✓
               </div>
-              <h3 className="mt-4 text-xl font-medium text-white">All checks passed!</h3>
+              <h3 className="mt-4 text-xl font-medium text-white">NO ISSUES FOUND</h3>
               <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-zinc-400">
-                Your repository has a detected framework of <strong className="text-zinc-200">{report.detectedConfig.frameworkName}</strong>, valid configuration, and no detected credential leaks.
+                No problems found in the checks DeployBuddy runs: framework detection, deployment config, environment files and leaked keys. This does not guarantee your build will succeed.
               </p>
             </div>
           ) : (
