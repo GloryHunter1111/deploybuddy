@@ -2,10 +2,12 @@ import { Route, Routes } from 'react-router-dom'
 import { AppShell } from './components/AppShell'
 import { ProtectedRoute } from './components/ProtectedRoute'
 import { DashboardPage } from './pages/DashboardPage'
+import { ForgotPasswordPage } from './pages/ForgotPasswordPage'
 import { LandingPage } from './pages/LandingPage'
 import { LoginPage } from './pages/LoginPage'
 import { PricingPage } from './pages/PricingPage'
 import { PrivacyPage } from './pages/PrivacyPage'
+import { ResetPasswordPage } from './pages/ResetPasswordPage'
 import { ScanPage } from './pages/ScanPage'
 import { TermsPage } from './pages/TermsPage'
 
@@ -16,6 +18,8 @@ export function App() {
         <Route path="/" element={<LandingPage />} />
         <Route path="/scan" element={<ScanPage />} />
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="/pricing" element={<PricingPage />} />
         <Route path="/terms" element={<TermsPage />} />
         <Route path="/privacy" element={<PrivacyPage />} />

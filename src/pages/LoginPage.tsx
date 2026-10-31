@@ -1,5 +1,5 @@
 import { type FormEvent, useState } from 'react'
-import { Navigate, useLocation, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { isSupabaseConfigured, supabase, supabaseConfigurationMessage } from '../lib/supabase'
 
@@ -48,7 +48,17 @@ export function LoginPage() {
       {!isSupabaseConfigured && <div className="mt-6 rounded-lg border border-amber-400/20 bg-amber-400/10 p-3 text-sm leading-6 text-amber-100">{supabaseConfigurationMessage}</div>}
       <form className="mt-7 space-y-4" onSubmit={handleSubmit}>
         <div><label htmlFor="email" className="label">Email</label><input className="input-field mt-2" id="email" type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></div>
-        <div><label htmlFor="password" className="label">Password</label><input className="input-field mt-2" id="password" type="password" autoComplete={isSignUp ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} required /></div>
+        <div>
+          <label htmlFor="password" className="label">Password</label>
+          <input className="input-field mt-2" id="password" type="password" autoComplete={isSignUp ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} required />
+          {!isSignUp && (
+            <div className="mt-2 text-right">
+              <Link to="/forgot-password" className="text-xs text-lime-300 hover:text-lime-200 hover:underline">
+                Forgot password?
+              </Link>
+            </div>
+          )}
+        </div>
         {error && <p className="text-sm text-rose-300" role="alert">{error}</p>}
         <button className="button-primary w-full" type="submit" disabled={isSubmitting}>
           {isSubmitting ? (isSignUp ? 'Signing up…' : 'Signing in…') : (isSignUp ? 'Sign up' : 'Sign in')}
