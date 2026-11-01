@@ -1,68 +1,129 @@
 import { type FormEvent, useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import { isSupabaseConfigured, supabase, supabaseConfigurationMessage } from '../lib/supabase'
 
+type Step = 'verify' | 'password' | 'success'
+
 export function ResetPasswordPage() {
-  const [isCheckingSession, setIsCheckingSession] = useState(true)
-  const [hasValidSession, setHasValidSession] = useState(false)
+  const location = useLocation()
+  const routerEmail = (location.state as { email?: string } | null)?.email || ''
+
+  const [step, setStep] = useState<Step>('verify')
+  const [email, setEmail] = useState(routerEmail)
+  const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [error, setError] = useState('')
+  const [resendMessage, setResendMessage] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const [isSuccess, setIsSuccess] = useState(false)
+  const [isResending, setIsResending] = useState(false)
+  const [resendCooldown, setResendCooldown] = useState(0)
 
   useEffect(() => {
+    if (resendCooldown <= 0) return
+    const timer = setInterval(() => {
+      setResendCooldown((prev) => (prev <= 1 ? 0 : prev - 1))
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [resendCooldown])
+
+  useEffect(() => {
+    if (step === 'success' && supabase) {
+      void supabase.auth.signOut()
+    }
+  }, [step])
+
+  async function handleVerifySubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
     if (!supabase) {
-      setIsCheckingSession(false)
+      setError(supabaseConfigurationMessage)
       return
     }
 
-    let isMounted = true
+    const trimmedEmail = email.trim()
+    const trimmedCode = code.trim()
 
-    // 1. Listen for the PASSWORD_RECOVERY event or an active session
-    const {
-      data: { subscription },
-    } = supabase.auth.onAuthStateChange((event, session) => {
-      if (!isMounted) return
-      if (event === 'PASSWORD_RECOVERY' || (session && (event === 'SIGNED_IN' || event === 'INITIAL_SESSION'))) {
-        setHasValidSession(true)
-        setIsCheckingSession(false)
+    if (!trimmedEmail) {
+      setError('Please enter your email address.')
+      return
+    }
+
+    if (trimmedCode.length !== 6) {
+      setError('That code is invalid or has expired.')
+      return
+    }
+
+    setError('')
+    setResendMessage('')
+    setIsSubmitting(true)
+
+    try {
+      const { data, error: verifyError } = await supabase.auth.verifyOtp({
+        email: trimmedEmail,
+        token: trimmedCode,
+        type: 'recovery',
+      })
+
+      if (verifyError || (!data?.user && !data?.session)) {
+        setIsSubmitting(false)
+        setError('That code is invalid or has expired.')
+        return
       }
-    })
 
-    // 2. Check for an existing session
-    void supabase.auth.getSession().then(({ data, error: sessionError }) => {
-      if (!isMounted) return
-      if (data?.session && !sessionError) {
-        setHasValidSession(true)
-        setIsCheckingSession(false)
-      } else {
-        const hash = window.location.hash
-        const search = window.location.search
-        const hasParams =
-          hash.includes('access_token') ||
-          hash.includes('type=recovery') ||
-          search.includes('code=')
+      setIsSubmitting(false)
+      setError('')
+      setStep('password')
+    } catch {
+      setIsSubmitting(false)
+      setError('That code is invalid or has expired.')
+    }
+  }
 
-        if (!hasParams || hash.includes('error=')) {
-          setIsCheckingSession(false)
-        } else {
-          // Allow time for Supabase client to parse URL tokens if present
-          const timer = setTimeout(() => {
-            if (isMounted) setIsCheckingSession(false)
-          }, 1500)
-          return () => clearTimeout(timer)
+  async function handleResendCode() {
+    if (resendCooldown > 0 || isResending) return
+    if (!supabase) {
+      setError(supabaseConfigurationMessage)
+      return
+    }
+
+    const trimmedEmail = email.trim()
+    if (!trimmedEmail) {
+      setError('Please enter your email address to receive a code.')
+      return
+    }
+
+    setError('')
+    setResendMessage('')
+    setIsResending(true)
+
+    try {
+      const { error: resendError } = await supabase.auth.resetPasswordForEmail(trimmedEmail)
+      if (resendError) {
+        const msg = (resendError.message || '').toLowerCase()
+        const status = (resendError as { status?: number }).status
+        const isRateLimit =
+          status === 429 ||
+          msg.includes('rate limit') ||
+          msg.includes('too many requests') ||
+          msg.includes('security purposes')
+
+        if (isRateLimit) {
+          setError('Too many requests. Please wait a few moments before trying again.')
+          setIsResending(false)
+          return
         }
       }
-    })
 
-    return () => {
-      isMounted = false
-      subscription.unsubscribe()
+      setResendMessage('A new 6-digit code has been sent to your email.')
+      setResendCooldown(60)
+    } catch {
+      setError('Failed to resend code. Please try again.')
+    } finally {
+      setIsResending(false)
     }
-  }, [])
+  }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handlePasswordSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     if (!supabase) {
       setError(supabaseConfigurationMessage)
@@ -84,17 +145,20 @@ export function ResetPasswordPage() {
 
     try {
       const { error: updateError } = await supabase.auth.updateUser({ password })
-      setIsSubmitting(false)
-
       if (updateError) {
+        setIsSubmitting(false)
         setError(updateError.message || 'Failed to update password. Please try again.')
         return
       }
 
-      setIsSuccess(true)
+      await supabase.auth.signOut()
+      setPassword('')
+      setConfirmPassword('')
+      setIsSubmitting(false)
+      setStep('success')
     } catch {
       setIsSubmitting(false)
-      setError('An unexpected error occurred. Please try again.')
+      setError('Failed to update password. Please try again.')
     }
   }
 
@@ -109,39 +173,167 @@ export function ResetPasswordPage() {
           </div>
         )}
 
-        {isCheckingSession ? (
-          <div className="py-8 text-center">
-            <h1 className="text-2xl font-semibold tracking-tight text-white">
-              Checking recovery session…
-            </h1>
-            <p className="mt-3 text-sm text-zinc-400">
-              Please wait while we verify your password reset link.
-            </p>
-          </div>
-        ) : !hasValidSession ? (
+        {step === 'verify' && (
           <div className="mt-3">
             <h1 className="text-3xl font-semibold tracking-tight text-white">
-              Invalid or expired link.
+              Enter reset code.
             </h1>
             <p className="mt-3 text-sm leading-6 text-zinc-400">
-              This reset link is invalid or has expired.
+              Check your email for a 6-digit verification code.
             </p>
-            <div className="mt-6">
-              <Link to="/forgot-password" className="button-primary w-full text-center">
-                Request a new reset link
-              </Link>
-            </div>
-            <div className="mt-4 flex items-center justify-center gap-4 text-xs text-zinc-400">
-              <Link to="/forgot-password" className="hover:text-lime-300 hover:underline">
-                Forgot password
-              </Link>
-              <span aria-hidden="true">•</span>
-              <Link to="/login" className="hover:text-lime-300 hover:underline">
-                Back to sign in
-              </Link>
-            </div>
+
+            <form className="mt-7 space-y-4" onSubmit={handleVerifySubmit}>
+              <div>
+                <label htmlFor="email" className="label">
+                  Email
+                </label>
+                <input
+                  className="input-field mt-2"
+                  id="email"
+                  name="email"
+                  type="email"
+                  autoComplete="email"
+                  value={email}
+                  onChange={(event) => setEmail(event.target.value)}
+                  required
+                />
+              </div>
+
+              <div>
+                <label htmlFor="code" className="label">
+                  6-digit code
+                </label>
+                <input
+                  className="input-field mt-2 tracking-widest text-lg font-mono placeholder:tracking-normal placeholder:font-sans"
+                  id="code"
+                  name="code"
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  maxLength={6}
+                  value={code}
+                  onChange={(event) => {
+                    const nextValue = event.target.value.replace(/\D/g, '').slice(0, 6)
+                    setCode(nextValue)
+                  }}
+                  placeholder="123456"
+                  required
+                />
+              </div>
+
+              {resendMessage && (
+                <div
+                  className="rounded-lg border border-lime-400/20 bg-lime-400/10 p-3 text-sm leading-6 text-lime-200"
+                  role="status"
+                >
+                  {resendMessage}
+                </div>
+              )}
+
+              {error && (
+                <p className="text-sm text-rose-300" role="alert">
+                  {error}
+                </p>
+              )}
+
+              <button className="button-primary w-full" type="submit" disabled={isSubmitting}>
+                {isSubmitting ? 'Verifying code…' : 'Verify code'}
+              </button>
+
+              <div>
+                <button
+                  type="button"
+                  onClick={handleResendCode}
+                  disabled={resendCooldown > 0 || isResending}
+                  className="button-secondary w-full"
+                >
+                  {resendCooldown > 0
+                    ? `Resend code (${resendCooldown}s)`
+                    : isResending
+                      ? 'Resending…'
+                      : 'Resend code'}
+                </button>
+              </div>
+
+              <div className="pt-2 text-center text-sm text-zinc-400">
+                <Link
+                  to="/login"
+                  className="font-medium text-lime-300 hover:text-lime-200 hover:underline"
+                >
+                  Back to sign in
+                </Link>
+              </div>
+            </form>
           </div>
-        ) : isSuccess ? (
+        )}
+
+        {step === 'password' && (
+          <div className="mt-3">
+            <h1 className="text-3xl font-semibold tracking-tight text-white">
+              Set new password.
+            </h1>
+            <p className="mt-3 text-sm leading-6 text-zinc-400">
+              Please choose a new password that is at least 8 characters long.
+            </p>
+
+            <form className="mt-7 space-y-4" onSubmit={handlePasswordSubmit}>
+              <div>
+                <label htmlFor="new-password" className="label">
+                  New password
+                </label>
+                <input
+                  className="input-field mt-2"
+                  id="new-password"
+                  name="new-password"
+                  type="password"
+                  autoComplete="new-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  required
+                  minLength={8}
+                />
+              </div>
+
+              <div>
+                <label htmlFor="confirm-password" className="label">
+                  Confirm password
+                </label>
+                <input
+                  className="input-field mt-2"
+                  id="confirm-password"
+                  name="confirm-password"
+                  type="password"
+                  autoComplete="new-password"
+                  value={confirmPassword}
+                  onChange={(event) => setConfirmPassword(event.target.value)}
+                  required
+                  minLength={8}
+                />
+              </div>
+
+              {error && (
+                <p className="text-sm text-rose-300" role="alert">
+                  {error}
+                </p>
+              )}
+
+              <button className="button-primary w-full" type="submit" disabled={isSubmitting}>
+                {isSubmitting ? 'Updating password…' : 'Update password'}
+              </button>
+
+              <div className="pt-2 text-center text-sm text-zinc-400">
+                <Link
+                  to="/login"
+                  className="font-medium text-lime-300 hover:text-lime-200 hover:underline"
+                >
+                  Back to sign in
+                </Link>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {step === 'success' && (
           <div className="mt-3 space-y-6">
             <h1 className="text-3xl font-semibold tracking-tight text-white">
               Password updated.
@@ -165,63 +357,6 @@ export function ResetPasswordPage() {
                 Back to sign in
               </Link>
             </div>
-          </div>
-        ) : (
-          <div className="mt-3">
-            <h1 className="text-3xl font-semibold tracking-tight text-white">
-              Set new password.
-            </h1>
-            <p className="mt-3 text-sm leading-6 text-zinc-400">
-              Please choose a new password that is at least 8 characters long.
-            </p>
-            <form className="mt-7 space-y-4" onSubmit={handleSubmit}>
-              <div>
-                <label htmlFor="new-password" className="label">
-                  New password
-                </label>
-                <input
-                  className="input-field mt-2"
-                  id="new-password"
-                  type="password"
-                  autoComplete="new-password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  required
-                  minLength={8}
-                />
-              </div>
-              <div>
-                <label htmlFor="confirm-password" className="label">
-                  Confirm password
-                </label>
-                <input
-                  className="input-field mt-2"
-                  id="confirm-password"
-                  type="password"
-                  autoComplete="new-password"
-                  value={confirmPassword}
-                  onChange={(event) => setConfirmPassword(event.target.value)}
-                  required
-                  minLength={8}
-                />
-              </div>
-              {error && (
-                <p className="text-sm text-rose-300" role="alert">
-                  {error}
-                </p>
-              )}
-              <button className="button-primary w-full" type="submit" disabled={isSubmitting}>
-                {isSubmitting ? 'Updating password…' : 'Update password'}
-              </button>
-              <div className="pt-2 text-center text-sm text-zinc-400">
-                <Link
-                  to="/login"
-                  className="font-medium text-lime-300 hover:text-lime-200 hover:underline"
-                >
-                  Back to sign in
-                </Link>
-              </div>
-            </form>
           </div>
         )}
       </div>

@@ -1,12 +1,12 @@
 import { type FormEvent, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { isSupabaseConfigured, supabase, supabaseConfigurationMessage } from '../lib/supabase'
 
 export function ForgotPasswordPage() {
+  const navigate = useNavigate()
   const [email, setEmail] = useState('')
   const [error, setError] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const [submitted, setSubmitted] = useState(false)
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -15,15 +15,17 @@ export function ForgotPasswordPage() {
       return
     }
 
+    const trimmedEmail = email.trim()
+    if (!trimmedEmail) {
+      setError('Please enter your email address.')
+      return
+    }
+
     setError('')
     setIsSubmitting(true)
 
     try {
-      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-        redirectTo: window.location.origin + '/reset-password',
-      })
-
-      setIsSubmitting(false)
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(trimmedEmail)
 
       if (resetError) {
         const msg = (resetError.message || '').toLowerCase()
@@ -40,27 +42,32 @@ export function ForgotPasswordPage() {
           msg.includes('failed to fetch')
 
         if (isRateLimit) {
+          setIsSubmitting(false)
           setError('Too many requests. Please wait a few moments before trying again.')
           return
         }
 
         if (isNetwork) {
+          setIsSubmitting(false)
           setError('Network error. Please check your connection and try again.')
           return
         }
 
-        // For all other errors (such as email not found), show neutral message
+        // For all other errors (such as email not found), show neutral behavior and navigate
       }
 
-      setSubmitted(true)
+      setIsSubmitting(false)
+      navigate('/reset-password', { state: { email: trimmedEmail } })
     } catch (err: unknown) {
       setIsSubmitting(false)
       const errorObj = err as { message?: string }
       const msg = (errorObj?.message || '').toLowerCase()
-      if (msg.includes('network') || msg.includes('fetch') || msg.includes('failed to fetch')) {
+      if (msg.includes('rate limit') || msg.includes('too many requests')) {
+        setError('Too many requests. Please wait a few moments before trying again.')
+      } else if (msg.includes('network') || msg.includes('fetch') || msg.includes('failed to fetch')) {
         setError('Network error. Please check your connection and try again.')
       } else {
-        setError('Something went wrong. Please check your connection and try again.')
+        navigate('/reset-password', { state: { email: trimmedEmail } })
       }
     }
   }
@@ -73,7 +80,7 @@ export function ForgotPasswordPage() {
           Reset password.
         </h1>
         <p className="mt-3 text-sm leading-6 text-zinc-400">
-          Enter your email address and we'll send you a link to reset your password.
+          Enter your email address and we'll send you a 6-digit code to reset your password.
         </p>
 
         {!isSupabaseConfigured && (
@@ -82,60 +89,38 @@ export function ForgotPasswordPage() {
           </div>
         )}
 
-        {submitted ? (
-          <div className="mt-6 space-y-6">
-            <div
-              className="rounded-lg border border-lime-400/20 bg-lime-400/10 p-4 text-sm leading-6 text-lime-200"
-              role="status"
-            >
-              If an account exists for that email, we’ve sent a reset link.
-            </div>
-            <p className="text-xs text-zinc-400">
-              Please check your inbox and spam folder. The link will expire after a short period.
-            </p>
-            <div className="text-center text-sm text-zinc-400">
-              <Link
-                to="/login"
-                className="font-medium text-lime-300 hover:text-lime-200 hover:underline"
-              >
-                Back to sign in
-              </Link>
-            </div>
+        <form className="mt-7 space-y-4" onSubmit={handleSubmit}>
+          <div>
+            <label htmlFor="email" className="label">
+              Email
+            </label>
+            <input
+              className="input-field mt-2"
+              id="email"
+              type="email"
+              autoComplete="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              required
+            />
           </div>
-        ) : (
-          <form className="mt-7 space-y-4" onSubmit={handleSubmit}>
-            <div>
-              <label htmlFor="email" className="label">
-                Email
-              </label>
-              <input
-                className="input-field mt-2"
-                id="email"
-                type="email"
-                autoComplete="email"
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
-                required
-              />
-            </div>
-            {error && (
-              <p className="text-sm text-rose-300" role="alert">
-                {error}
-              </p>
-            )}
-            <button className="button-primary w-full" type="submit" disabled={isSubmitting}>
-              {isSubmitting ? 'Sending reset link…' : 'Send reset link'}
-            </button>
-            <div className="pt-2 text-center text-sm text-zinc-400">
-              <Link
-                to="/login"
-                className="font-medium text-lime-300 hover:text-lime-200 hover:underline"
-              >
-                Back to sign in
-              </Link>
-            </div>
-          </form>
-        )}
+          {error && (
+            <p className="text-sm text-rose-300" role="alert">
+              {error}
+            </p>
+          )}
+          <button className="button-primary w-full" type="submit" disabled={isSubmitting}>
+            {isSubmitting ? 'Sending code…' : 'Send reset code'}
+          </button>
+          <div className="pt-2 text-center text-sm text-zinc-400">
+            <Link
+              to="/login"
+              className="font-medium text-lime-300 hover:text-lime-200 hover:underline"
+            >
+              Back to sign in
+            </Link>
+          </div>
+        </form>
       </div>
     </section>
   )
