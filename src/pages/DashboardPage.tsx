@@ -169,13 +169,12 @@ export function DashboardPage() {
                 Free plan users can save 1 project at a time. Upgrade to Pro for unlimited project tracking and automated Netlify deployments.
               </p>
             </div>
-            <button
-              type="button"
-              onClick={() => alert("Stripe subscription billing will arrive in Phase 2.")}
+            <Link
+              to="/pricing"
               className="button-primary text-xs py-2 px-3.5 whitespace-nowrap self-start sm:self-center"
             >
               Upgrade to Pro
-            </button>
+            </Link>
           </div>
         </div>
       )}
