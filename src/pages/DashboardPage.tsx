@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { BILLING_ENABLED } from '../lib/billing'
 import { deleteProject, getUserPlan, getUserProjects, type ProjectRecord, rescanProject } from '../lib/projects'
 import { isSupabaseConfigured, supabaseConfigurationMessage } from '../lib/supabase'
 
@@ -117,9 +118,11 @@ export function DashboardPage() {
         <div>
           <div className="flex items-center gap-3">
             <h1 className="text-4xl font-semibold tracking-tight text-white">Saved projects</h1>
-            <span className={`badge ${plan === 'pro' ? 'badge-success' : 'badge-info'}`}>
-              {plan === 'pro' ? 'Pro Plan' : 'Free Plan'}
-            </span>
+            {BILLING_ENABLED && (
+              <span className={`badge ${plan === 'pro' ? 'badge-success' : 'badge-info'}`}>
+                {plan === 'pro' ? 'Pro Plan' : 'Free Plan'}
+              </span>
+            )}
           </div>
           <p className="mt-3 text-zinc-400">
             Signed in as <span className="text-zinc-200">{session?.user.email ?? 'your account'}</span>.
@@ -157,7 +160,7 @@ export function DashboardPage() {
       )}
 
       {/* Free Plan Limit Notice */}
-      {isLimitReached && !isLoading && (
+      {BILLING_ENABLED && isLimitReached && !isLoading && (
         <div className="mt-8 rounded-2xl border border-amber-400/20 bg-zinc-900/60 p-5 backdrop-blur">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>

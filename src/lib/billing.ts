@@ -1,3 +1,5 @@
+export const BILLING_ENABLED = false
+
 export function buildCheckoutUrl(userId: string, email: string): string | null {
   const baseUrl = import.meta.env.VITE_LEMONSQUEEZY_CHECKOUT_URL
   if (!baseUrl || typeof baseUrl !== 'string' || !baseUrl.trim()) {
@@ -17,4 +19,3 @@ export function buildCheckoutUrl(userId: string, email: string): string | null {
     return `${baseUrl.trim()}${separator}${params.toString()}`
   }
 }
-

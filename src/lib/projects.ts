@@ -1,3 +1,4 @@
+import { BILLING_ENABLED } from './billing'
 import { supabase } from './supabase'
 import { scanRepository, type ScanIssue, type ScanReport } from './scanner'
 
@@ -150,7 +151,9 @@ export async function saveProjectScan(
     return {
       success: false,
       limitReached: true,
-      message: "You've reached the free plan limit of 1 project. Upgrade to save more.",
+      message: BILLING_ENABLED
+        ? "You've reached the free plan limit of 1 project. Upgrade to save more."
+        : "You’ve reached the free limit of 1 saved project. Delete your saved project on the dashboard to save a different one.",
     }
   }
 

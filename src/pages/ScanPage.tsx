@@ -1,6 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { BILLING_ENABLED } from '../lib/billing'
 import { parseGitHubUrl, scanRepository, type ScanReport } from '../lib/scanner'
 import { getUserProjects, saveProjectScan } from '../lib/projects'
 import { isSupabaseConfigured, supabaseConfigurationMessage } from '../lib/supabase'
@@ -112,7 +113,12 @@ export function ScanPage() {
       const result = await saveProjectScan(session.user.id, report)
       if (result.limitReached) {
         setIsLimitReached(true)
-        setSaveErrorMessage(result.message || "You've reached the free plan limit of 1 project. Upgrade to save more.")
+        setSaveErrorMessage(
+          result.message ||
+            (BILLING_ENABLED
+              ? "You've reached the free plan limit of 1 project. Upgrade to save more."
+              : "You’ve reached the free limit of 1 saved project. Delete your saved project on the dashboard to save a different one."),
+        )
       } else if (!result.success) {
         setSaveErrorMessage(result.message || 'Failed to save project.')
       } else {
