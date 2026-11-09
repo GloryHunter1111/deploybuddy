@@ -1,4 +1,5 @@
 export const BILLING_ENABLED = false
+export const FREE_PROJECT_LIMIT = 5
 
 export function buildCheckoutUrl(userId: string, email: string): string | null {
   const baseUrl = import.meta.env.VITE_LEMONSQUEEZY_CHECKOUT_URL

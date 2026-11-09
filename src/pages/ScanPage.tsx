@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react'
 import { Link, useLocation, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { BILLING_ENABLED } from '../lib/billing'
+import { BILLING_ENABLED, FREE_PROJECT_LIMIT } from '../lib/billing'
 import { parseGitHubUrl, scanRepository, type ScanReport } from '../lib/scanner'
 import { getUserProjects, saveProjectScan } from '../lib/projects'
 import { isSupabaseConfigured, supabaseConfigurationMessage } from '../lib/supabase'
@@ -116,8 +116,8 @@ export function ScanPage() {
         setSaveErrorMessage(
           result.message ||
             (BILLING_ENABLED
-              ? "You've reached the free plan limit of 1 project. Upgrade to save more."
-              : "You’ve reached the free limit of 1 saved project. Delete your saved project on the dashboard to save a different one."),
+              ? `You've reached the free plan limit of ${FREE_PROJECT_LIMIT} projects. Upgrade to save more.`
+              : `You’ve reached the free limit of ${FREE_PROJECT_LIMIT} saved projects. Delete one on the dashboard to save another.`),
         )
       } else if (!result.success) {
         setSaveErrorMessage(result.message || 'Failed to save project.')
@@ -313,7 +313,7 @@ export function ScanPage() {
                   </div>
                   {isLimitReached && (
                     <span className="badge badge-warning self-start sm:self-center">
-                      1/1 Free Project Used
+                      {FREE_PROJECT_LIMIT}/{FREE_PROJECT_LIMIT} Free Projects Used
                     </span>
                   )}
                 </div>

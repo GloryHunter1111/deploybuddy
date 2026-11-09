@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { BILLING_ENABLED } from '../lib/billing'
+import { BILLING_ENABLED, FREE_PROJECT_LIMIT } from '../lib/billing'
 import { deleteProject, getUserPlan, getUserProjects, type ProjectRecord, rescanProject } from '../lib/projects'
 import { isSupabaseConfigured, supabaseConfigurationMessage } from '../lib/supabase'
 
@@ -109,7 +109,7 @@ export function DashboardPage() {
   }
 
   const isFreePlan = plan === 'free'
-  const isLimitReached = isFreePlan && projects.length >= 1
+  const isLimitReached = isFreePlan && projects.length >= FREE_PROJECT_LIMIT
 
   return (
     <section className="mx-auto max-w-6xl px-5 py-16 sm:py-24">
@@ -126,7 +126,7 @@ export function DashboardPage() {
           </div>
           <p className="mt-3 text-zinc-400">
             Signed in as <span className="text-zinc-200">{session?.user.email ?? 'your account'}</span>.
-            {isFreePlan && ` • Free plan limit: ${projects.length}/1 project used`}
+            {isFreePlan && ` • Free plan limit: ${projects.length}/${FREE_PROJECT_LIMIT} projects used`}
           </p>
         </div>
 
@@ -165,11 +165,11 @@ export function DashboardPage() {
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>
               <div className="flex items-center gap-2">
-                <span className="badge badge-warning">1/1 Free slot</span>
-                <h2 className="text-base font-semibold text-white">You're using your 1 free saved project slot</h2>
+                <span className="badge badge-warning">{FREE_PROJECT_LIMIT}/{FREE_PROJECT_LIMIT} Free slots</span>
+                <h2 className="text-base font-semibold text-white">You're using your {FREE_PROJECT_LIMIT} free saved project slots</h2>
               </div>
               <p className="mt-1 text-sm text-zinc-400">
-                Free plan users can save 1 project at a time. Upgrade to Pro for unlimited project tracking and automated Netlify deployments.
+                Free plan users can save up to {FREE_PROJECT_LIMIT} projects at a time. Upgrade to Pro for unlimited project tracking and automated Netlify deployments.
               </p>
             </div>
             <Link

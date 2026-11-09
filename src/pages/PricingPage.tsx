@@ -1,14 +1,14 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
-import { BILLING_ENABLED, buildCheckoutUrl } from '../lib/billing'
+import { BILLING_ENABLED, buildCheckoutUrl, FREE_PROJECT_LIMIT } from '../lib/billing'
 import { getUserPlan } from '../lib/projects'
 import { PRO_PRICE_USD } from '../lib/site'
 
 const freeFeatures = [
   'Scan any public GitHub repository',
   'Plain-English fix list with copyable snippets',
-  '1 saved project on your dashboard',
+  `Save up to ${FREE_PROJECT_LIMIT} projects on your dashboard`,
   'Fair-use limits may apply to scans',
 ]
 

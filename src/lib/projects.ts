@@ -1,4 +1,4 @@
-import { BILLING_ENABLED } from './billing'
+import { BILLING_ENABLED, FREE_PROJECT_LIMIT } from './billing'
 import { supabase } from './supabase'
 import { scanRepository, type ScanIssue, type ScanReport } from './scanner'
 
@@ -147,13 +147,13 @@ export async function saveProjectScan(
 
   // 3. If new project, enforce free plan limit
   const plan = await getUserPlan(userId)
-  if (plan === 'free' && existingProjects.length >= 1) {
+  if (plan === 'free' && existingProjects.length >= FREE_PROJECT_LIMIT) {
     return {
       success: false,
       limitReached: true,
       message: BILLING_ENABLED
-        ? "You've reached the free plan limit of 1 project. Upgrade to save more."
-        : "You’ve reached the free limit of 1 saved project. Delete your saved project on the dashboard to save a different one.",
+        ? `You've reached the free plan limit of ${FREE_PROJECT_LIMIT} projects. Upgrade to save more.`
+        : `You’ve reached the free limit of ${FREE_PROJECT_LIMIT} saved projects. Delete one on the dashboard to save another.`,
     }
   }
 
