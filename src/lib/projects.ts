@@ -42,6 +42,24 @@ export interface SaveProjectResult {
   message?: string
 }
 
+async function scanWithAccessToken(repoUrl: string, accessToken: string): Promise<ScanReport> {
+  const response = await fetch('/.netlify/functions/scan-repo', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ repoUrl }),
+  })
+  const data = await response.json()
+
+  if (!response.ok) {
+    throw new Error(data?.message || data?.error || `Scan service responded with error status ${response.status}.`)
+  }
+
+  return data as ScanReport
+}
+
 /**
  * Retrieves the user's plan ('free' or 'pro'). Defaults to 'free'.
  */
@@ -206,7 +224,10 @@ export async function rescanProject(
     throw new Error('Supabase is not configured.')
   }
 
-  const report = await scanRepository(project.repo_url, onProgress)
+  const { data: { session } } = await supabase.auth.getSession()
+  const report = session?.access_token
+    ? await scanWithAccessToken(project.repo_url, session.access_token)
+    : await scanRepository(project.repo_url, onProgress)
 
   const scanPayload = {
     issues: report.issues,

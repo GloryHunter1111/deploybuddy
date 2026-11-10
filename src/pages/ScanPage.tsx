@@ -4,7 +4,25 @@ import { useAuth } from '../context/AuthContext'
 import { BILLING_ENABLED, FREE_PROJECT_LIMIT } from '../lib/billing'
 import { parseGitHubUrl, scanRepository, type ScanReport } from '../lib/scanner'
 import { getUserProjects, saveProjectScan } from '../lib/projects'
-import { isSupabaseConfigured, supabaseConfigurationMessage } from '../lib/supabase'
+import { isSupabaseConfigured, supabase, supabaseConfigurationMessage } from '../lib/supabase'
+
+async function scanWithAccessToken(repoUrl: string, accessToken: string): Promise<ScanReport> {
+  const response = await fetch('/.netlify/functions/scan-repo', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({ repoUrl }),
+  })
+  const data = await response.json()
+
+  if (!response.ok) {
+    throw new Error(data?.message || data?.error || `Scan service responded with error status ${response.status}.`)
+  }
+
+  return data as ScanReport
+}
 
 export function ScanPage() {
   const { session } = useAuth()
@@ -58,9 +76,14 @@ export function ScanPage() {
     setScanStatus('Connecting to GitHub…')
 
     try {
-      const result = await scanRepository(targetUrl, (status) => {
-        setScanStatus(status)
-      })
+      const { data: { session: currentSession } } = supabase
+        ? await supabase.auth.getSession()
+        : { data: { session: null } }
+      const result = currentSession?.access_token
+        ? await scanWithAccessToken(targetUrl, currentSession.access_token)
+        : await scanRepository(targetUrl, (status) => {
+            setScanStatus(status)
+          })
       setReport(result)
       if (session) {
         void checkExistingProject(targetUrl, result.owner, result.repo)

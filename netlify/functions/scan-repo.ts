@@ -7,6 +7,10 @@ import {
   DetectedConfig,
   IssueSeverity,
 } from '../scanner-core/analyze'
+import { createHmac } from 'node:crypto'
+
+const ANON_DAILY_LIMIT = 5
+const SIGNED_IN_DAILY_LIMIT = 20
 
 export type { IssueSeverity, ScanIssue, DetectedConfig, ScanReport }
 
@@ -216,6 +220,7 @@ export const handler = async (event: {
   httpMethod: string
   body?: string | null
   queryStringParameters?: Record<string, string | undefined>
+  headers?: Record<string, string | undefined>
 }) => {
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -229,6 +234,45 @@ export const handler = async (event: {
       statusCode: 204,
       headers: corsHeaders,
       body: '',
+    }
+  }
+
+  let scanStart = Date.now()
+  let visitorKey: string | null = null
+  let signedIn = false
+  const scanSalt = process.env.SCAN_SALT
+  const supabaseUrl = process.env.VITE_SUPABASE_URL
+  const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+  const today = new Date().toISOString().slice(0, 10)
+  const logScanEvent = async (
+    ok: boolean,
+    report: ScanReport | null,
+    errorType: 'rate_limit' | 'not_found' | 'timeout' | 'github_error' | 'invalid_url' | 'other' | null,
+  ) => {
+    if (!scanSalt || !visitorKey || !supabaseUrl || !serviceRoleKey) return
+
+    try {
+      await fetch(`${supabaseUrl}/rest/v1/scan_events`, {
+        method: 'POST',
+        headers: {
+          apikey: serviceRoleKey,
+          Authorization: `Bearer ${serviceRoleKey}`,
+          Prefer: 'return=minimal',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ok,
+          duration_ms: Date.now() - scanStart,
+          framework: report?.detectedConfig.framework ?? null,
+          issue_count: ok ? report?.issues.length ?? null : null,
+          error_type: errorType,
+          signed_in: signedIn,
+          visitor_key: visitorKey,
+        }),
+      })
+    } catch {
+      // Logging must not affect scanning.
     }
   }
 
@@ -256,7 +300,65 @@ export const handler = async (event: {
       }
     }
 
+    if (scanSalt) {
+      const authorization = event.headers?.authorization || event.headers?.Authorization
+      let userId: string | null = null
+
+      if (authorization?.startsWith('Bearer ') && supabaseUrl && supabaseAnonKey) {
+        try {
+          const userResponse = await fetch(`${supabaseUrl}/auth/v1/user`, {
+            headers: {
+              apikey: supabaseAnonKey,
+              Authorization: authorization,
+            },
+          })
+          if (userResponse.ok) {
+            const user = await userResponse.json()
+            if (typeof user?.id === 'string') userId = user.id
+          }
+        } catch {
+          // Treat verification failures as anonymous requests.
+        }
+      }
+
+      signedIn = Boolean(userId)
+      const forwardedFor = event.headers?.['x-forwarded-for'] || event.headers?.['X-Forwarded-For']
+      const clientIp = event.headers?.['x-nf-client-connection-ip'] || event.headers?.['X-Nf-Client-Connection-Ip'] || forwardedFor?.split(',')[0]?.trim() || ''
+      visitorKey = createHmac('sha256', `${scanSalt}${today}`).update(userId || clientIp).digest('hex')
+
+      if (supabaseUrl && serviceRoleKey) {
+        try {
+          const dayStart = `${today}T00:00:00.000Z`
+          const countResponse = await fetch(
+            `${supabaseUrl}/rest/v1/scan_events?visitor_key=eq.${encodeURIComponent(visitorKey)}&created_at=gte.${encodeURIComponent(dayStart)}&select=id`,
+            {
+              headers: {
+                apikey: serviceRoleKey,
+                Authorization: `Bearer ${serviceRoleKey}`,
+                Prefer: 'count=exact',
+                Range: '0-0',
+              },
+            },
+          )
+          const total = Number(countResponse.headers.get('content-range')?.split('/')[1])
+          const limit = signedIn ? SIGNED_IN_DAILY_LIMIT : ANON_DAILY_LIMIT
+          if (countResponse.ok && Number.isFinite(total) && total >= limit) {
+            const message = 'Daily scan limit reached (5 per day for visitors, 20 when signed in). Please try again tomorrow.'
+            await logScanEvent(false, null, 'rate_limit')
+            return {
+              statusCode: 429,
+              headers: corsHeaders,
+              body: JSON.stringify({ error: message }),
+            }
+          }
+        } catch {
+          // Count failures must not block scanning.
+        }
+      }
+    }
+
     const report = await performServerScan(repoUrl)
+    await logScanEvent(true, report, null)
 
     return {
       statusCode: 200,
@@ -266,6 +368,18 @@ export const handler = async (event: {
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal scanner error.'
     const statusCode = message.includes('not found') ? 404 : message.includes('rate limit') ? 429 : 400
+    const errorType = message.includes('valid GitHub repository URL')
+      ? 'invalid_url'
+      : message.includes('not found')
+        ? 'not_found'
+        : message.includes('timeout')
+          ? 'timeout'
+          : message.includes('rate limit')
+            ? 'rate_limit'
+            : message.includes('GitHub') || message.includes('repository')
+              ? 'github_error'
+              : 'other'
+    await logScanEvent(false, null, errorType)
 
     return {
       statusCode,
