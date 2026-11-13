@@ -231,7 +231,7 @@ function isSecretLikeEnvName(name: string): boolean {
 function stripComments(code: string): string {
   return code
     .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/\/\/.*/g, '')
+    .replace(/(^|[^:\\w'"\/])\/\/.*$/gm, '$1')
     .replace(/<!--[\s\S]*?-->/g, '')
 }
 
