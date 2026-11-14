@@ -35,7 +35,7 @@ export function ScanPage() {
   const [isScanning, setIsScanning] = useState(false)
   const [scanStatus, setScanStatus] = useState('')
   const [report, setReport] = useState<ScanReport | null>(null)
-  const [copiedIndex, setCopiedIndex] = useState<number | null>(null)
+  const [copiedAction, setCopiedAction] = useState<string | null>(null)
 
   // Save project state
   const [isSaving, setIsSaving] = useState(false)
@@ -156,14 +156,30 @@ export function ScanPage() {
     }
   }
 
-  async function handleCopy(text: string, index: number) {
+  async function handleCopy(text: string, action: string) {
     try {
       await navigator.clipboard.writeText(text)
-      setCopiedIndex(index)
-      window.setTimeout(() => setCopiedIndex(null), 2000)
+      setCopiedAction(action)
+      window.setTimeout(() => setCopiedAction(null), 2000)
     } catch {
       // Fallback
     }
+  }
+
+  function handleDemoScan() {
+    const demoUrl = 'https://github.com/GloryHunter1111/deploybuddy-demo-broken'
+    setRepoUrl(demoUrl)
+    setSearchParams({ repo: demoUrl })
+    void performScan(demoUrl)
+  }
+
+  function buildAiPrompt(issue: ScanReport['issues'][number]) {
+    const frameworkName = report?.detectedConfig.frameworkName
+    const framework = frameworkName && frameworkName.toLowerCase() !== 'unknown'
+      ? ` ${frameworkName}`
+      : ''
+
+    return `I’m deploying a${framework} app and a deployment checker found this issue:\n\n${issue.severity} ${issue.title}\n${issue.description}\n\nSuggested fix:\n${issue.snippet}\n\nPlease apply the fix to my project and explain what you changed.`
   }
 
   const criticalCount = report?.issues.filter((i) => i.severity === 'critical').length ?? 0
@@ -181,22 +197,33 @@ export function ScanPage() {
       </p>
 
       <form
-        className="mt-10 rounded-2xl border border-white/10 bg-zinc-900/70 p-4 shadow-2xl shadow-black/20 sm:flex sm:gap-3"
+        className="mt-10 rounded-2xl border border-white/10 bg-zinc-900/70 p-4 shadow-2xl shadow-black/20 sm:flex sm:items-start sm:gap-3"
         onSubmit={handleSubmit}
         noValidate
       >
         <label className="sr-only" htmlFor="repo-url">GitHub repository URL</label>
-        <input
-          id="repo-url"
-          className="input-field"
-          value={repoUrl}
-          onChange={(event) => setRepoUrl(event.target.value)}
-          placeholder="https://github.com/owner/repository"
-          inputMode="url"
+        <div className="min-w-0 flex-1">
+          <input
+            id="repo-url"
+            className="input-field"
+            value={repoUrl}
+            onChange={(event) => setRepoUrl(event.target.value)}
+            placeholder="https://github.com/owner/repository"
+            inputMode="url"
+            disabled={isScanning}
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <p className="mt-2 text-xs text-zinc-500">No repo handy? Try our intentionally broken demo.</p>
+        </div>
+        <button
+          className="button-secondary mt-3 w-full whitespace-nowrap shrink-0 sm:mt-0 sm:w-auto"
           disabled={isScanning}
-          autoComplete="off"
-          spellCheck={false}
-        />
+          type="button"
+          onClick={handleDemoScan}
+        >
+          Try the demo
+        </button>
         <button
           className="button-primary mt-3 w-full sm:mt-0 sm:w-auto whitespace-nowrap shrink-0"
           disabled={isScanning || !repoUrl.trim()}
@@ -371,13 +398,22 @@ export function ScanPage() {
                     <div className="relative mt-4">
                       <div className="flex items-center justify-between rounded-t-lg border-x border-t border-white/5 bg-zinc-900/90 px-3 py-1.5 text-xs text-zinc-400">
                         <span className="font-mono">Suggested fix</span>
-                        <button
-                          type="button"
-                          onClick={() => void handleCopy(issue.snippet, index)}
-                          className="font-mono text-xs text-zinc-300 hover:text-lime-300 transition-colors"
-                        >
-                          {copiedIndex === index ? 'Copied ✓' : 'Copy snippet'}
-                        </button>
+                        <div className="flex items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => void handleCopy(issue.snippet, `${index}-snippet`)}
+                            className="font-mono text-xs text-zinc-300 hover:text-lime-300 transition-colors"
+                          >
+                            {copiedAction === `${index}-snippet` ? 'Copied ✓' : 'Copy snippet'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleCopy(buildAiPrompt(issue), `${index}-prompt`)}
+                            className="font-mono text-xs text-zinc-300 hover:text-lime-300 transition-colors"
+                          >
+                            {copiedAction === `${index}-prompt` ? 'Copied ✓' : 'Copy as AI prompt'}
+                          </button>
+                        </div>
                       </div>
                       <pre className="overflow-x-auto rounded-b-lg border border-white/5 bg-zinc-950 p-3 text-xs text-lime-200 font-mono">
                         <code>{issue.snippet}</code>
