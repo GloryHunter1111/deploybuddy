@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { CONTACT_EMAIL } from '../lib/site'
+import { CONTACT_EMAIL, FEEDBACK_FORM_URL } from '../lib/site'
 
 export function SiteFooter() {
   return (
@@ -10,6 +10,14 @@ export function SiteFooter() {
           <Link to="/pricing" className="transition-colors hover:text-white">Pricing</Link>
           <Link to="/terms" className="transition-colors hover:text-white">Terms</Link>
           <Link to="/privacy" className="transition-colors hover:text-white">Privacy</Link>
+          <a
+            href={FEEDBACK_FORM_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="transition-colors hover:text-white"
+          >
+            Feedback
+          </a>
           <a href={`mailto:${CONTACT_EMAIL}`} className="transition-colors hover:text-white">Contact</a>
         </nav>
       </div>

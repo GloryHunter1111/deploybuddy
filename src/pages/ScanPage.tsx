@@ -4,6 +4,7 @@ import { useAuth } from '../context/AuthContext'
 import { BILLING_ENABLED, FREE_PROJECT_LIMIT } from '../lib/billing'
 import { parseGitHubUrl, scanRepository, type ScanReport } from '../lib/scanner'
 import { getUserProjects, saveProjectScan } from '../lib/projects'
+import { FEEDBACK_FORM_URL } from '../lib/site'
 import { isSupabaseConfigured, supabase, supabaseConfigurationMessage } from '../lib/supabase'
 
 async function scanWithAccessToken(repoUrl: string, accessToken: string): Promise<ScanReport> {
@@ -424,6 +425,19 @@ export function ScanPage() {
               ))}
             </div>
           )}
+
+          <p className="mt-8 text-center text-sm text-zinc-500">
+            Missed something or found a bug?{' '}
+            <a
+              href={FEEDBACK_FORM_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-zinc-400 underline transition-colors hover:text-white"
+            >
+              Tell us
+            </a>
+            .
+          </p>
         </div>
       )}
     </section>
